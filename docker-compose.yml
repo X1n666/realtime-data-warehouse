@@ -2,6 +2,10 @@
 # 内存预算 ≈ 5.75G；WSL2 需 .wslconfig 限 memory=8GB
 # 版本锁定：Flink 1.19.1 / Kafka 3.5.2 KRaft / MySQL 8.0 / Grafana 11.1.0
 
+# 固定 compose 项目名：目录为中文名（实时数据分析平台）时 compose 默认项目名
+# 会非法/变化，导致网络名（submit_sql.sh 写死）漂移；显式固定为英文名
+name: ecommerce-realtime-data-warehouse
+
 services:
   mysql:
     image: mysql:8.0
