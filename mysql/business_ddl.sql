@@ -6,7 +6,7 @@
 --   3. payment_info.create_time = 支付时间（GMV 口径依据）
 -- =============================================================
 
-USE gmall;
+USE gmall_rt;
 
 -- 用户表
 CREATE TABLE IF NOT EXISTS user_info (

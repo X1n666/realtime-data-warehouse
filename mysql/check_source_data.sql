@@ -5,7 +5,7 @@
 --   2. 为后续 DataX 同步、ODS 行数校验、ADS 指标抽样提供基准
 -- =============================================================
 
-USE gmall;
+USE gmall_rt;
 
 -- 1. 基础行数：确认每张源表是否有数据
 SELECT 'base_province' AS table_name, COUNT(*) AS row_count FROM base_province

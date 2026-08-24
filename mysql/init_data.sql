@@ -6,7 +6,7 @@
 --   3. SPU/SKU 保留 update_time，后续可演示商品资料增量同步
 -- =============================================================
 
-USE gmall;
+USE gmall_rt;
 
 -- 省份维度：覆盖华北、华东、华南、西南等地区，足够支撑地区主题指标演示
 INSERT INTO base_province (id, name, region_id, area_code) VALUES

@@ -1,0 +1,98 @@
+# 电商实时数仓 - WSL2 独立环境（V2 设计第 6 节）
+# 内存预算 ≈ 5.75G；WSL2 需 .wslconfig 限 memory=8GB
+# 版本锁定：Flink 1.19.1 / Kafka 3.5.2 KRaft / MySQL 8.0 / Grafana 11.1.0
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: gmall_mysql
+    mem_limit: 1g
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: gmall_rt
+      TZ: Asia/Shanghai
+    command:
+      - "mysqld"
+      - "--log-bin=mysql-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--server-id=1"
+      - "--binlog-expire-logs-seconds=2592000"
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p123456"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: gmall_kafka
+    mem_limit: 1536m
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  jobmanager:
+    image: flink:1.19.1
+    container_name: gmall_jobmanager
+    mem_limit: 768m
+    command: jobmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+      - TZ=Asia/Shanghai
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./flink-lib:/opt/flink/lib
+      - ./flink-conf:/opt/flink/conf
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  taskmanager:
+    image: flink:1.19.1
+    container_name: gmall_taskmanager
+    mem_limit: 2g
+    command: taskmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=2
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./flink-lib:/opt/flink/lib
+      - ./flink-conf:/opt/flink/conf
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: gmall_grafana
+    mem_limit: 512m
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin

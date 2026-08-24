@@ -11,7 +11,7 @@ CREATE DATABASE IF NOT EXISTS gmall_report
 DEFAULT CHARACTER SET utf8mb4
 DEFAULT COLLATE utf8mb4_0900_ai_ci;
 
-USE gmall_report;
+USE gmall_report_rt;
 
 CREATE TABLE IF NOT EXISTS ads_gmv_day (
     dt DATE NOT NULL COMMENT 'Business date',
