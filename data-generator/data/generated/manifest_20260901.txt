@@ -1,0 +1,9 @@
+# 交易数据 manifest — 测试日 2026-09-01（V2 三段事务）
+dt=2026-09-01
+seed=20260901
+args=--users 100 --orders 200 --user-pool 100
+rows: order_info=200(paid=170 refunded=12 unpaid=18) order_detail=398 payment_info=182 order_refund_info=12 user_info=100
+sql_checksum=380656a01242e7e5206815c630ba9c65
+generated_by=generate_business_data.py (V2 交易生命周期三段)
+loaded_into=gmall_mysql gmall_rt @ 2026-08-24
+verify=binlog ROW+FULL+expire30d
