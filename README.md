@@ -2,7 +2,7 @@
 
 > 一句话定位：用 **Flink + Kafka + Flink CDC** 在单机 WSL2 环境里搭建一个"物理四层"的电商实时数仓，覆盖**行为日志**与**交易数据**两大域，产出 PV/UV/GMV/支付/退款等指标，支持批流对账与可视化。
 >
-> 设计总纲：《实时数仓项目设计方案V2.md》（桌面根目录），本项目 README 是其运行态快照。
+> 设计总纲：《实时数仓项目设计方案V2.md》（项目根目录），本项目 README 是其运行态快照。学习资料（Flink 复习笔记、交接提示词、SQL 错题手册、面试手册）见 [docs/](docs/)。
 
 ---
 
@@ -210,5 +210,7 @@ ecommerce-realtime-data-warehouse/
 ├── scripts/submit_sql.sh       # 作业提交脚本（独立容器 + remote target）
 ├── data-generator/             # 行为日志生成器 V2 / 业务生成器 V2 + manifest
 ├── mysql/                      # business DDL、init、ads 结果库 DDL
+├── docs/                       # 学习文档（Flink 复习笔记、交接提示词、SQL 错题手册、面试手册）
+├── 实时数仓项目设计方案V2.md   # 设计总纲
 └── README.md
 ```
