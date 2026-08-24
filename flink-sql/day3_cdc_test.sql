@@ -2,10 +2,14 @@
 -- 运行方式（避免占用 jobmanager 容器 cgroup 内存）:
 --   docker run --rm --network ecommerce-realtime-data-warehouse_default \
 --     -v $PWD/flink-lib:/opt/flink/lib -v $PWD/flink-sql:/tmp/flink-sql \
---     flink:1.19.1 /opt/flink/bin/sql-client.sh -f /tmp/flink-sql/day3_cdc_test.sql
--- 注意: MySQL TZ=Asia/Shanghai(+8), 必须显式 server-time-zone 否则校验失败
+--     flink:1.19.1 /opt/flink/bin/sql-client.sh \
+--     -Djobmanager.rpc.address=jobmanager -Djobmanager.rpc.port=6123 \
+--     -Drest.address=jobmanager -Drest.port=8081 \
+--     -f /tmp/flink-sql/day3_cdc_test.sql
+-- 注意: MySQL TZ=Asia/Shanghai(+8), 必须显式 server-time-zone 否则校验失败；
+--       remote target 的集群地址从 flink-conf.yaml/-D 读，不是 SET
 SET 'sql-client.execution.result-mode' = 'TABLEAU';
-SET 'execution.target' = 'local';
+SET 'execution.target' = 'remote';
 
 CREATE TABLE payment_cdc (
   id            BIGINT,

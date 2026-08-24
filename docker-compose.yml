@@ -79,7 +79,7 @@ services:
     command: taskmanager
     environment:
       - JOB_MANAGER_RPC_ADDRESS=jobmanager
-      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=2
+      - TASK_MANAGER_NUMBER_OF_TASK_SLOTS=4
       - TASK_MANAGER_MEMORY_PROCESS_SIZE=1536m
       - TZ=Asia/Shanghai
     volumes:
