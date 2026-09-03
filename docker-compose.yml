@@ -111,7 +111,14 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      # 节点7：provisioning 自动注册 MySQL 数据源 + 加载看板（10s 热更新）
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
 
 volumes:
   mysql-data:

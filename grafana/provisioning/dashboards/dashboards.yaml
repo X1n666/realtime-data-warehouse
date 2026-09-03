@@ -1,0 +1,13 @@
+# Dashboard provider：从容器内目录自动加载看板 JSON（10s 轮询，改文件即热更新）
+apiVersion: 1
+
+providers:
+  - name: '实时数仓看板'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

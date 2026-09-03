@@ -1,0 +1,144 @@
+{
+  "uid": "rt-realtime-overview",
+  "title": "电商实时数仓 · 实时指标总览",
+  "timezone": "Asia/Shanghai",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "title": "累计 GMV（按支付日）",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CAST(metric_value AS DECIMAL(20,2)) AS gmv FROM ads_trade_day WHERE metric_name='gmv' ORDER BY metric_date DESC LIMIT 1",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyCNY", "decimals": 2, "color": { "mode": "fixed", "fixedColor": "green" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "支付订单数",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CAST(metric_value AS DECIMAL(20,2)) AS orders FROM ads_trade_day WHERE metric_name='payment_order_count' ORDER BY metric_date DESC LIMIT 1",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "title": "支付用户数",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CAST(metric_value AS DECIMAL(20,2)) AS users FROM ads_trade_day WHERE metric_name='payment_user_count' ORDER BY metric_date DESC LIMIT 1",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "title": "累计退款金额（按退款日）",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CAST(SUM(metric_value) AS DECIMAL(20,2)) AS refunds FROM ads_trade_day WHERE metric_name='refund_amount'",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyCNY", "decimals": 2, "color": { "mode": "fixed", "fixedColor": "orange" } }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "title": "日浏览 PV",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CAST(metric_value AS DECIMAL(20,2)) AS pv FROM ads_traffic_day WHERE metric_name='browse_pv' ORDER BY metric_date DESC LIMIT 1",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "日 UV（独立去重）",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CAST(metric_value AS DECIMAL(20,2)) AS uv FROM ads_traffic_day WHERE metric_name='day_uv' ORDER BY metric_date DESC LIMIT 1",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0, "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "title": "分钟浏览 PV（时间序列）",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT CONVERT_TZ(window_start, '+08:00', '+00:00') AS time, CAST(metric_value AS DOUBLE) AS browse_pv FROM ads_traffic_1m WHERE metric_name='browse_pv' AND $__timeFilter(window_start) ORDER BY time",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "bars", "fillOpacity": 40, "lineWidth": 1 } }, "overrides": [] }
+    },
+    {
+      "id": 8,
+      "title": "指标明细（ADS 层当前值）",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "datasource": { "type": "mysql", "uid": "mysql-rt" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT metric_date, metric_name, metric_value FROM ads_trade_day WHERE metric_date >= DATE_SUB(CURDATE(), INTERVAL 3 DAY) UNION ALL SELECT metric_date, metric_name, metric_value FROM ads_traffic_day WHERE metric_date >= DATE_SUB(CURDATE(), INTERVAL 3 DAY) ORDER BY metric_date DESC, metric_name",
+          "datasource": { "type": "mysql", "uid": "mysql-rt" }
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    }
+  ],
+  "templating": { "list": [] },
+  "annotations": { "list": [] }
+}
