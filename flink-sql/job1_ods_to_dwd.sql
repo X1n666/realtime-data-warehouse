@@ -191,3 +191,58 @@ SELECT
   id, user_id, order_id, sku_id, refund_amount, refund_status,
   CAST(create_time AS TIMESTAMP(3))
 FROM refund_cdc;
+
+-- =============================================================
+-- 订单明细域分支：CDC(order_detail) -> dwd_order_detail（节点10）
+-- 设计同支付/退款分支：主键 id、声明 PRIMARY KEY、透传无去重
+-- 指标闭环: Job2 交易日聚合下单指标（order_gmv=SUM(order_price*sku_num)
+--   / order_count=COUNT DISTINCT order_id / order_detail_count），
+--   与支付 GMV 对照 = 下单→支付转化视角（不接下游=死表，见开发日志 节点10）
+-- server-id 5420-5424（与 payment/refund 分段独立，防同 broker 踢下线）
+-- =============================================================
+CREATE TABLE order_detail_cdc (
+  id          BIGINT,
+  order_id    BIGINT,
+  sku_id      BIGINT,
+  sku_name    STRING,
+  img_url     STRING,
+  order_price DECIMAL(16, 2),
+  sku_num     BIGINT,
+  create_time TIMESTAMP(0),
+  update_time TIMESTAMP(0),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector'         = 'mysql-cdc',
+  'hostname'          = 'mysql',
+  'port'              = '3306',
+  'username'          = 'root',
+  'password'          = '123456',
+  'database-name'     = 'gmall_rt',
+  'table-name'        = 'order_detail',
+  'scan.startup.mode' = 'initial',
+  'server-id'         = '5420-5424',
+  'server-time-zone'  = 'Asia/Shanghai'
+);
+
+CREATE TABLE dwd_order_detail (
+  id          BIGINT,
+  order_id    BIGINT,
+  sku_id      BIGINT,
+  sku_name    STRING,
+  order_price DECIMAL(16, 2),
+  sku_num     BIGINT,
+  create_time TIMESTAMP(3),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'upsert-kafka',
+  'topic' = 'dwd_order_detail',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'key.format' = 'json',
+  'value.format' = 'json'
+);
+
+INSERT INTO dwd_order_detail
+SELECT
+  id, order_id, sku_id, sku_name, order_price, sku_num,
+  CAST(create_time AS TIMESTAMP(3))
+FROM order_detail_cdc;

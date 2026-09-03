@@ -26,13 +26,15 @@
   → MySQL gmall_rt（9 表）→ binlog │
                            │
         ┌──────────────────┴───────────────────┐
-        │ Job1 ×3 作业（并行度 1）ODS → DWD    │
+        │ Job1 ×4 作业（并行度 1）ODS → DWD    │
         │  · 流量：Kafka → 解析清洗/去重       │
         │  · 支付：CDC(payment_info) → 透传    │
         │  · 退款：CDC(order_refund_info) → 透传│
+        │  · 订单明细：CDC(order_detail) → 透传 │
         │  → dwd_traffic_event                │
         │  → dwd_payment_detail（主键=id）     │
         │  → dwd_refund_detail（主键=id）      │
+        │  → dwd_order_detail（主键=id）       │
         └──────────────────────────────────────┘
                           │（交易 DWD 经一次性按时间序重放，
                           │  见 dwd_payment_detail_sorted，节点8）
@@ -40,7 +42,7 @@
         │ Job2 ×4 作业（并行度 1）DWD → DWS     │
         │  · 分钟窗口：browse PV / 分钟 UV      │
         │  · 日 PV/UV：明细独立重算（不 SUM 分钟）│
-        │  · 交易日 4 指标：非窗口按日持续累计  │
+        │  · 交易日 7 指标：非窗口按日持续累计  │
         │  · 交易分钟：GMV / 支付订单数（窗口） │
         │  → dws_traffic_1m / dws_traffic_day  │
         │  → dws_trade_day / dws_trade_1m      │
@@ -58,7 +60,7 @@
 
 **分层语义**：ODS（原样接入）→ DWD（明细清洗、去重、规范化）→ DWS（按指标聚合的中间结果）→ ADS（面向展示的结果表）。
 
-**物理四层已于 2026-09-03 达成**（开发日志 节点 6+8）：**11 作业三层拓扑**（Job1×3 / Job2×4 / Job3×4）全部 RUNNING。拆作业的关键收益：**指标只在 Job2 算一次**（拆前 ads 分支从 DWD 明细重复计算 = 每指标双份窗口/去重状态），Job3 读 DWS 聚合后的"当前绝对值" + 同主键覆盖写 MySQL → **无状态作业**（无窗口/去重/累计算子，重启秒级、重放天然幂等）。节点 8 后分钟指标补齐（分钟 UV / 交易分钟 GMV、订单数），分钟层共 4 指标 × 分钟窗口驱动趋势曲线。
+**物理四层已于 2026-09-03 达成**（开发日志 节点 6+8+10）：**12 作业三层拓扑**（Job1×4 / Job2×4 / Job3×4）全部 RUNNING。拆作业的关键收益：**指标只在 Job2 算一次**（拆前 ads 分支从 DWD 明细重复计算 = 每指标双份窗口/去重状态），Job3 读 DWS 聚合后的"当前绝对值" + 同主键覆盖写 MySQL → **无状态作业**（无窗口/去重/累计算子，重启秒级、重放天然幂等）。节点 8 后分钟指标补齐（分钟 UV / 交易分钟 GMV、订单数），分钟层共 4 指标 × 分钟窗口驱动趋势曲线；节点 10 交易域扩到下单侧（订单明细 CDC → 下单金额/单数/明细行数，与支付 GMV 对照 = 下单→支付转化视角），日指标 6 → 9。
 
 ---
 
@@ -118,7 +120,7 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 
 **退款时间分布**：退款 create_time 滞后支付 1-2 天（9/1 支付，退款落在 9/1-9/3）——生成器模拟真实业务，退款按"退款时间"归日聚合（开发日志 节点 3）。
 
-### 4.3 指标口径锚点（固定 6 项，禁止漂移）
+### 4.3 指标口径锚点（支付/流量 6 项 + 下单 3 项 = 9 项，禁止漂移）
 
 | # | 指标         | 口径                                             | 对账方式                    |
 | - | ------------ | ------------------------------------------------ | --------------------------- |
@@ -128,10 +130,15 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | 4 | GMV          | SUCCESS 支付金额，按支付时间，**不减退款** | 批 SQL：COUNT/SUM           |
 | 5 | 支付订单数   | DISTINCT order_id（支付流水）                    | 同上                        |
 | 6 | 日支付用户数 | 自然日内 DISTINCT user_id（支付流水）            | 同上                        |
+| 7 | 下单金额     | SUM(order_price×sku_num)，按下单时间（节点10 新增，来源 dwd_order_detail）| 批 SQL：SUM               |
+| 8 | 下单订单数   | DISTINCT order_id（订单明细表）                  | 批 SQL：COUNT(DISTINCT)     |
+| 9 | 下单明细行数 | COUNT(*)（订单明细行）                           | 批 SQL：COUNT(*)            |
 
 **红线**：禁止 `SUM(分钟UV)` 当日 UV、`SUM(分钟支付用户数)` 当日支付用户数、browse+click 混合当 PV。分钟指标与日指标天然不可加（同一用户可跨多个分钟窗口活跃），差异要在对账中写清楚，而不是消除。
 
 **分钟层补充指标（节点 8，锚点外"中间指标"，不参与日对账）**：分钟 UV（窗口内 browse 去重）、交易分钟 GMV / 支付订单数（TUMBLE 窗口，事件时间 = create_time 本地墙上时间）。分钟值用于趋势图；日锚点仍由日表独立兜底（红线同前）。
+
+**下单侧对照（节点 10，锚点 7-9）**：测试日 2026-09-01 下单金额 **1,334,596.00（200 单）** vs 支付 GMV **1,136,485.35（182 单）**，差值 = 下单未支付部分——天然的下单→支付漏斗第一层，与支付/退款三链路合起来覆盖交易完整生命周期（下单→支付→退款）。订单明细**不参与窗口聚合**（日聚合按 DATE 分组天然容忍乱序），故消费未经 sorted 重放的 dwd_order_detail（对比支付必须 sorted：窗口水位推进要求事件时间单调，见节点 8）。
 
 ### 4.4 幂等性与可重放
 
@@ -165,17 +172,18 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | dwd_payment_detail | DWD 支付明细（CDC 原样）| Job1     | changelog | id（支付流水，非 order_id——同订单可多流水）        |
 | dwd_payment_detail_sorted | 支付明细按时间序重放版（节点8：重灌伪影→真实事件流）| replay 脚本 | changelog | 同上                               |
 | dwd_refund_detail  | DWD 退款明细 | Job1     | changelog | id（退款流水）                                     |
+| dwd_order_detail   | DWD 订单明细 | Job1     | changelog | id（明细行，节点10 新增）                          |
 | dws_traffic_1m     | DWS 流量分钟 | Job2     | Upsert   | metric_date+window_start+metric_name+dimension_key |
 | dws_traffic_day    | DWS 流量日   | Job2     | Upsert   | metric_date+metric_name+dimension_key              |
 | dws_trade_day      | DWS 交易日   | Job2     | Upsert   | 同上（无 window_start）                            |
 | dws_trade_1m       | DWS 交易分钟 | Job2     | Upsert   | metric_date+window_start+metric_name+dimension_key |
 
-（设计初稿中的 dwd_order_detail 未实现：订单明细 398 行留在 MySQL 源库，DWD 只做支付/退款两交易链路。Job2 交易域消费 `dwd_payment_detail_sorted`——原因见 开发日志 节点 8：测试数据 id 流水号与支付时间错位 + CDC snapshot 主键扫描 → topic 内事件时间乱序 → 水位跳变丢窗口；重放工具 [scripts/replay_dwd_payment_sorted.sh](scripts/replay_dwd_payment_sorted.sh) 幂等可重跑。）
+Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因见 开发日志 节点 8：测试数据 id 流水号与支付时间错位 + CDC snapshot 主键扫描 → topic 内事件时间乱序 → 水位跳变丢窗口；重放工具 [scripts/replay_dwd_payment_sorted.sh](scripts/replay_dwd_payment_sorted.sh) 幂等可重跑。下单侧（dwd_order_detail，节点 10）消费**未经重放的原始 topic**：日聚合按 DATE 分组不依赖水位，乱序天然无害——两套链路（窗口 vs 非窗口）消费策略的对照，面试可讲。
 
 ### 5.3 MySQL
 
 - **gmall_rt**（CDC 源库，9 表）：user_info / base_province / base_category / spu_info / sku_info / order_info / order_detail / payment_info / order_refund_info。binlog ROW + FULL + expire 30 天。
-- **gmall_report_rt**（结果库，DDL 4 表，实际写入 4 表）：ads_traffic_1m（33 窗口）/ ads_traffic_day / ads_trade_day / ads_trade_1m（162 窗口）由 Job3 覆盖写。
+- **gmall_report_rt**（结果库，DDL 见 [mysql/ads_result_rt_ddl.sql](mysql/ads_result_rt_ddl.sql)，实际写入 4 表，均由 Job3 覆盖写）：ads_traffic_1m（33 窗口）/ ads_traffic_day / ads_trade_day（9 行 = 9/1 七指标 + 9/2、9/3 退款）/ ads_trade_1m（162 窗口）。**此库为独立 database**（非 gmall_rt 源库）——建表脚本在 MySQL 空卷初始化后执行过，容器重建/卷丢失后需重跑该 DDL 再启 Job3。
 
 ### 5.4 测试日数据（2026-09-01）
 
@@ -203,6 +211,7 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | 节点7 | **Grafana 看板**：provisioning 注册数据源 + 8 面板                                                       | 数据源/看板注册 ✓；代理查询取数 ✓（浏览器 localhost:3000 admin/admin）                     |
 | 节点8 | **分钟指标补齐**：流量分钟 UV + 交易分钟表 + 一键启动脚本                                                | 分钟 UV 33 窗口 627≤PV 636 ✓；交易分钟 **162 窗口** GMV 1,119,295.10 = 日 1,136,485.35 − 尾部单笔 17,190.25 ✓；抽 3 分钟窗口 vs MySQL 明细逐值相等 ✓（11 作业 RUNNING） |
 | 节点9 | **看板分钟层补齐**：9 面板（PV/UV 双系列 + 分钟 GMV 曲线）                                                | API 验证：9 面板注册 ✓；GMV 序列 162 行 / UV 33 行取数 ✓（浏览器 localhost:3000 admin/admin）                                          |
+| 节点10 | **下单侧链路（加分）**：Job1 加订单明细 CDC 分支（server-id 5420-5424）→ dwd_order_detail；Job2 交易日聚合 +3 指标（下单金额/单数/明细行数）；start_env.sh 支持 Job1×4 | **7/7 流=批 ✓**（下单金额 1,334,596.00 / 200 单 / 398 明细行；旧 4 指标 1,136,485.35/182/83/退款按日不变；分钟层 162/33 窗口完好）12 作业 RUNNING（Job1×4/Job2×4/Job3×4） |
 
 **过程中修掉的关键问题**（面试可讲，均记录在开发日志）：
 
@@ -216,19 +225,42 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 8. 多分支 SQL 文件改动单个分支时不能整文件重跑（重复提交 → 同 group 瓜分）→ 抽单段单独提交
 9. **共享 consumer group 第二次踩**（节点8）：给既有文件的日 INSERT 旁加分钟 INSERT 时，直接复用了原 source DDL → 两个独立作业同 group → rebalance 中断分钟消费。教训：**同一文件每新增一个 INSERT 分支，其 source 必须再立一份 DDL + 独立 group.id**（job2_dwd 的日段 source 早独立，trade 加段时漏了）
 10. **事件时间乱序 → 水位跳变丢窗口**（节点8，最值钱）：CDC snapshot 按主键扫描输出，而测试数据 id 流水号与支付时间错位 → topic 内时间非单调 → 窗口只 fire 43 个（中午前）就停。分层排查法：非窗口日聚合对账正确 → 临时无窗口小时统计全量 ✓ → dump topic 时间序列见乱序 → 机制 = upsert-kafka 水位按物理消费序推进，先读到晚事件则其后早事件全被判"迟到"丢弃。修复 = 一次性按时间序重放成"真实事件流"（replay 工具，与流量 generator replay 同哲学）
+11. **误双提 + 异步 cancel 竞赛 → 作业风暴**（节点10）：提交命令笔误执行两次 → 同 server-id 的 CDC 作业互相踢下线 → 15 个 RUNNING/RESTARTING 循环，cancel 与 restart 赛跑清不掉 → 正确恢复 = **重启 jobmanager**（standalone 无 HA，作业全灭，数据在 Kafka/MySQL 不丢）→ 按依赖序一键重提 12 作业。教训：CDC 多作业必须分段 server-id，恢复用"全灭重建"而不是逐 job cancel；另修复 start_env.sh CRLF 坑（Windows docker.exe 管道输出 CRLF 化 → URL 混入 \r，curl exit 3）
 
 ---
 
-## 7. 后续方向（当前里程碑已完成，均为可选项）
+## 7. 项目经验 ↔ 学习资料交叉引用
+
+简历/面试用：下方三份笔记覆盖了本项目 90% 踩坑点的原理层；项目反过来是三份笔记的"工程实证"。复习顺序建议：面试手册（广）→ SQL 错题册（SQL 手感）→ Flink 笔记（实时原理纵深），每看一条回 §6 找对应 bug 复盘。
+
+| # | 项目经验（§6 关键问题 / 开发日志节点） | Flink 学习与思考题复习笔记 | SQL 错题复习手册 | 数据开发实习面试复习手册 |
+| - | ------------------------------------- | -------------------------- | ---------------- | ------------------------ |
+| 1 | 物理四层 ODS/DWD/DWS/ADS + 12 作业、Job3 无状态化动机（节点6） | 第一讲 流处理全景（分层与流批对比） | — | 第一章 P0 1.1-1.2 数仓分层/表粒度 |
+| 2 | 锚点红线：分钟 UV/用户数不可 SUM 当日（节点4/5） | 第三讲 窗口（窗口与聚合粒度） | 一、聚合粒度与窗口函数 | 4.2 为什么 UV 不能把每天结果相加 |
+| 3 | order_gmv 1,334,596.00 vs gmv 1,136,485.35 = 下单→支付漏斗（节点10） | — | 一、聚合粒度（多表多粒度计数） | 5.3 漏斗转化率 / 5.1 PV 与 UV |
+| 4 | 支付流水 PK id 非 order_id；明细 vs 订单粒度（节点1） | 第一讲（粒度/主键语义） | 二、多表连接与数据膨胀 | 3.1 事务事实表 / 1.2 粒度 |
+| 5 | **水位跳变丢窗口**：乱序 → 早事件被判迟到（节点8 最值钱） | **第二讲 时间语义与 Watermark Q2/Q3** | — | 7.3 如何处理迟到数据 |
+| 6 | 尾部单事件窗口不触发（23:32 单笔 17,190.25，节点8） | 第三讲 窗口（触发条件=水位） | 三、日期窗口与滚动统计 | — |
+| 7 | 幂等：upsert-kafka + ON DUPLICATE、重跑不重复（节点6/10） | 第四讲 状态与 checkpoint | — | 7.1-7.2 幂等/盲目追加重复统计 |
+| 8 | CDC changelog 不声明主键 → -U/+U 当两条翻倍（节点1） | 第一讲（changelog/有状态） | — | 7.1 幂等 |
+| 9 | event_id ROW_NUMBER 取最早去重（DWD 流量，节点1 前） | 第一讲 思考题（去重） | 七、每组第一条/最后一条 | 7.3 迟到（同键后到覆盖） |
+| 10 | 日 PV/UV 独立 COUNT(DISTINCT) 重算（节点4） | 第三讲（无界聚合 vs 窗口） | 一、聚合粒度 | 4.2 不可加指标 |
+| 11 | 生成器字段索引错位、嵌套 ROW 解析清洗（Day2） | — | 六、条件聚合与 NULL | 6.1 DWD 清洗规则 |
+
+（三份笔记头部另有"← 项目交叉索引"提示行，见各文件第 1 行注释下方——项目实践笔记由此双向闭环。）
+
+---
+
+## 8. 后续方向（当前里程碑已完成，均为可选项）
 
 1. ~~第 2 周计划~~ 已全部完成（交易 DWD、交易 DWS、日 PV/UV、批流对账、拆三作业、Grafana）
 2. ~~分钟指标补齐（节点8）~~：分钟 UV（33 窗口）、dws_trade_1m 交易分钟（162 窗口）+ 一键启动脚本 scripts/start_env.sh
-3. dwd_order_detail 订单明细 CDC（扩大交易域覆盖，可选加分）
-4. 学习向：README 锚点 ↔ 面试手册/SQL 错题册对照复习（可选加分）
+3. ~~dwd_order_detail 订单明细 CDC（节点10 加分）~~：下单金额/单数/明细行数 3 指标流批对账 ✓（面试点：下单→支付→退款完整生命周期 + 漏斗对照）
+4. ~~学习向交叉引用（加分）~~：见上方 §7——三份笔记 ↔ 项目锚点/bug 双向对照表，含每讲思考题与项目机制的映射
 
 ---
 
-## 8. 目录结构
+## 9. 目录结构
 
 ```
 实时数据分析平台/            # 项目根目录（中文名；compose 已用 name: 字段固定项目名）

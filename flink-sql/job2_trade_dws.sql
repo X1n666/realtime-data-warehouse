@@ -1,11 +1,14 @@
 -- =============================================================
--- Job2 交易域：DWD(payment/refund) -> DWS(dws_trade_day)，只写 Kafka
+-- Job2 交易域：DWD(payment/refund/order_detail) -> DWS(dws_trade_day)，只写 Kafka
 -- ADS 落库由 Job3 无状态转发（节点6 拆三作业，见 job3_ads_sink.sql）
--- 指标（口径锚点 4/5/6）:
+-- 指标（口径锚点 4/5/6 + 节点10 下单侧锚点 7）:
 --   gmv                  = SUM(payment_amount) WHERE status='SUCCESS'，不退 refund
 --   payment_order_count  = COUNT(DISTINCT order_id)（支付订单数）
 --   payment_user_count   = COUNT(DISTINCT user_id)（日支付用户数）
 --   refund_amount        = SUM(refund_amount) WHERE refund_status='SUCCESS'（按退款日归日）
+--   order_gmv            = SUM(order_price*sku_num)（下单金额；与 gmv 对照=下单→支付转化）
+--   order_count          = COUNT(DISTINCT order_id)（下单订单数）
+--   order_detail_count   = COUNT(*)（下单明细行数）
 -- 时间归属: create_time（支付/退款时间，MySQL datetime 本地语义，无时区转换）
 -- 日聚合方式: GROUP BY CAST(create_time AS DATE) —— 非窗口持续累计
 --   （vs 窗口聚合: 无 watermark/迟到问题，任何时刻到达的支付归入其支付日）
@@ -62,6 +65,28 @@ CREATE TABLE dwd_refund_detail (
   'topic' = 'dwd_refund_detail',
   'properties.bootstrap.servers' = 'kafka:9092',
   'properties.group.id' = 'job2_trade_refund_day_group',
+  'key.format' = 'json',
+  'value.format' = 'json'
+);
+
+-- 订单明细 source（节点10 加分：下单侧指标）。独立 group（与支付/退款 source
+-- 各作业独立 group，防共享 group 消费中断 —— 节点8 教训），读取 job1 CDC 产出的
+-- dwd_order_detail（job1 一次性快照 + binlog，非 sorted 重放：订单不参与窗口
+-- 聚合，日聚合 GROUP BY DATE 天然容忍乱序，无需事件时间单调）
+CREATE TABLE dwd_order_detail (
+  id          BIGINT,
+  order_id    BIGINT,
+  sku_id      BIGINT,
+  sku_name    STRING,
+  order_price DECIMAL(16, 2),
+  sku_num     BIGINT,
+  create_time TIMESTAMP(3),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'upsert-kafka',
+  'topic' = 'dwd_order_detail',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'job2_trade_order_day_group',
   'key.format' = 'json',
   'value.format' = 'json'
 );
@@ -142,6 +167,30 @@ FROM (
     CAST(SUM(refund_amount) AS DECIMAL(18,2))
   FROM dwd_refund_detail
   WHERE refund_status = 'SUCCESS'
+  GROUP BY CAST(create_time AS DATE)
+  UNION ALL
+  SELECT
+    CAST(create_time AS DATE),
+    'order_gmv',
+    'ALL',
+    CAST(SUM(order_price * sku_num) AS DECIMAL(18,2))
+  FROM dwd_order_detail
+  GROUP BY CAST(create_time AS DATE)
+  UNION ALL
+  SELECT
+    CAST(create_time AS DATE),
+    'order_count',
+    'ALL',
+    CAST(COUNT(DISTINCT order_id) AS DECIMAL(18,2))
+  FROM dwd_order_detail
+  GROUP BY CAST(create_time AS DATE)
+  UNION ALL
+  SELECT
+    CAST(create_time AS DATE),
+    'order_detail_count',
+    'ALL',
+    CAST(COUNT(*) AS DECIMAL(18,2))
+  FROM dwd_order_detail
   GROUP BY CAST(create_time AS DATE)
 ) t;
 

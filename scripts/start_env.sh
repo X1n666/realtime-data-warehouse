@@ -15,10 +15,10 @@ cd "$(dirname "$0")/.."
 MODE="${1:-}"
 
 # ---------- 0. 配置 ----------
-JM=localhost:8081                 # jobmanager REST（host 映射）
+JM=http://localhost:8081          # jobmanager REST（host 映射）
 # 各文件预期分支数（RUNNING 计数达标即视为健康）
 declare -A JOBS=(
-  [job1_ods_to_dwd]=3
+  [job1_ods_to_dwd]=4
   [job2_dwd_to_dws]=2
   [job2_trade_dws]=2
   [job3_ads_sink]=4
@@ -87,8 +87,11 @@ run_count() { # 返回某 pipeline.name 的 RUNNING 作业数
     | python -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for j in d.get('jobs',[]) if j.get('state')=='RUNNING' and j.get('name')=='$1'))"
 }
 cancel_name() { # cancel 所有同名 RUNNING（防同 group 多作业冲突）
+  # 注意: docker exec 输出经 Windows docker.exe 管道会被 CRLF 化（空输出->\r\n），
+  #   read 剥 \n 后残留裸 \r 会混进 URL（curl exit 3 malformed）—— 用 tr -d '\r' 清洗
   docker exec gmall_jobmanager curl -s "$JM/jobs/overview" 2>/dev/null \
     | python -c "import json,sys; d=json.load(sys.stdin); print(' '.join(j['jid'] for j in d.get('jobs',[]) if j.get('state')=='RUNNING' and j.get('name')=='$1'))" \
+    | tr -d '\r' \
     | while read -r jids; do for jid in $jids; do
         docker exec gmall_jobmanager curl -s -X PATCH "$JM/jobs/$jid" > /dev/null; done; done
 }
