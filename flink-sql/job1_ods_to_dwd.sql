@@ -135,3 +135,59 @@ SELECT
   CAST(create_time   AS TIMESTAMP(3)),
   CAST(callback_time AS TIMESTAMP(3))
 FROM payment_cdc;
+
+-- =============================================================
+-- 退款域分支：CDC(order_refund_info) -> dwd_refund_detail
+-- 设计同支付分支：主键 id、声明 PRIMARY KEY、无去重（MySQL PK 保证）
+-- server-id 与支付分支不同段（同一作业多 CDC source 需独立 server-id，
+-- 同一 MySQL broker 上相同 server-id 会被踢下线）
+-- =============================================================
+CREATE TABLE refund_cdc (
+  id                BIGINT,
+  user_id           BIGINT,
+  order_id          BIGINT,
+  sku_id            BIGINT,
+  refund_type       STRING,
+  refund_num        BIGINT,
+  refund_amount     DECIMAL(16, 2),
+  refund_reason_type STRING,
+  refund_reason_txt STRING,
+  refund_status     STRING,
+  create_time       TIMESTAMP(0),
+  update_time       TIMESTAMP(0),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector'         = 'mysql-cdc',
+  'hostname'          = 'mysql',
+  'port'              = '3306',
+  'username'          = 'root',
+  'password'          = '123456',
+  'database-name'     = 'gmall_rt',
+  'table-name'        = 'order_refund_info',
+  'scan.startup.mode' = 'initial',
+  'server-id'         = '5410-5414',
+  'server-time-zone'  = 'Asia/Shanghai'
+);
+
+CREATE TABLE dwd_refund_detail (
+  id            BIGINT,
+  user_id       BIGINT,
+  order_id      BIGINT,
+  sku_id        BIGINT,
+  refund_amount DECIMAL(16, 2),
+  refund_status STRING,
+  create_time   TIMESTAMP(3),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH (
+  'connector' = 'upsert-kafka',
+  'topic' = 'dwd_refund_detail',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'key.format' = 'json',
+  'value.format' = 'json'
+);
+
+INSERT INTO dwd_refund_detail
+SELECT
+  id, user_id, order_id, sku_id, refund_amount, refund_status,
+  CAST(create_time AS TIMESTAMP(3))
+FROM refund_cdc;
