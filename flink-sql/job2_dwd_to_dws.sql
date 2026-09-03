@@ -83,17 +83,31 @@ CREATE TABLE dws_traffic_day (
   'value.format' = 'json'
 );
 
--- 分钟窗口：browse PV（窗口结束才触发，Upsert 输出当前值）
+-- 分钟窗口：browse PV / 分钟 UV（同窗口两指标 UNION ALL，窗口结束才触发）
+-- 分钟 UV 是中间指标（锚点 2）：窗口内去重，禁止 SUM 当日 UV（红线见日段注释）
 INSERT INTO dws_traffic_1m
-SELECT
-  CAST(biz_date AS DATE)                AS metric_date,
-  TUMBLE_START(ts_ltz, INTERVAL '1' MINUTE) AS window_start,
-  'browse_pv'                           AS metric_name,
-  'ALL'                                 AS dimension_key,
-  CAST(COUNT(*) AS DECIMAL(18, 2))      AS metric_value
-FROM dwd_traffic_event
-WHERE action_id = 'browse'
-GROUP BY biz_date, TUMBLE(ts_ltz, INTERVAL '1' MINUTE);
+SELECT metric_date, window_start, metric_name, dimension_key, metric_value
+FROM (
+  SELECT
+    CAST(biz_date AS DATE)                AS metric_date,
+    TUMBLE_START(ts_ltz, INTERVAL '1' MINUTE) AS window_start,
+    'browse_pv'                           AS metric_name,
+    'ALL'                                 AS dimension_key,
+    CAST(COUNT(*) AS DECIMAL(18, 2))      AS metric_value
+  FROM dwd_traffic_event
+  WHERE action_id = 'browse'
+  GROUP BY biz_date, TUMBLE(ts_ltz, INTERVAL '1' MINUTE)
+  UNION ALL
+  SELECT
+    CAST(biz_date AS DATE),
+    TUMBLE_START(ts_ltz, INTERVAL '1' MINUTE),
+    'browse_uv',
+    'ALL',
+    CAST(COUNT(DISTINCT uid) AS DECIMAL(18, 2))
+  FROM dwd_traffic_event
+  WHERE action_id = 'browse'
+  GROUP BY biz_date, TUMBLE(ts_ltz, INTERVAL '1' MINUTE)
+) t;
 
 -- =============================================================
 -- 日指标（dws_traffic_day）：从 DWD 明细独立重算，非窗口持续累计

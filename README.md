@@ -13,7 +13,7 @@
 **为什么做这个项目**（秋招导向）：
 
 - 覆盖大数据开发岗位的核心面试点：分层建模、事件时间与 watermark、窗口、状态与去重、checkpoint、CDC/changelog、Upsert 幂等、批流对账、故障恢复。
-- 简历亮点（当前状态即可这样写）：**物理四层实时数仓**（Job1 接入 / Job2 DWS / Job3 无状态 sink 已拆）、Flink CDC 交易链路、三阶段交易生命周期可复现对账、**6 指标批流全对**。
+- 简历亮点（当前状态即可这样写）：**物理四层实时数仓**（Job1 接入 / Job2 DWS / Job3 无状态 sink，**11 作业**全 RUNNING）、Flink CDC 交易链路、三阶段交易生命周期可复现对账、**6 指标批流全对 + 分钟级 UV/GMV 趋势逐值对账**、环境一键启动复现。
 
 ---
 
@@ -34,21 +34,23 @@
         │  → dwd_payment_detail（主键=id）     │
         │  → dwd_refund_detail（主键=id）      │
         └──────────────────────────────────────┘
-                          │
+                          │（交易 DWD 经一次性按时间序重放，
+                          │  见 dwd_payment_detail_sorted，节点8）
         ┌─────────────────┴─────────────────────┐
-        │ Job2 ×3 作业（并行度 1）DWD → DWS     │
-        │  · 分钟窗口：browse PV（watermark）   │
+        │ Job2 ×4 作业（并行度 1）DWD → DWS     │
+        │  · 分钟窗口：browse PV / 分钟 UV      │
         │  · 日 PV/UV：明细独立重算（不 SUM 分钟）│
-        │  · 交易 4 指标：非窗口按日持续累计    │
+        │  · 交易日 4 指标：非窗口按日持续累计  │
+        │  · 交易分钟：GMV / 支付订单数（窗口） │
         │  → dws_traffic_1m / dws_traffic_day  │
-        │  → dws_trade_day（upsert-kafka）      │
+        │  → dws_trade_day / dws_trade_1m      │
         └───────────────────────────────────────┘
                           │
         ┌─────────────────┴─────────────────────┐
-        │ Job3 ×3 作业（并行度 1，无状态 sink） │
+        │ Job3 ×4 作业（并行度 1，无状态 sink） │
         │  DWS 当前值 → MySQL 同主键覆盖写      │
         │  → ads_traffic_1m / ads_traffic_day   │
-        │  → ads_trade_day（gmall_report_rt）   │
+        │  → ads_trade_day / ads_trade_1m       │
         └───────────────────────────────────────┘
                           │
                      Grafana 看板（provisioning）
@@ -56,7 +58,7 @@
 
 **分层语义**：ODS（原样接入）→ DWD（明细清洗、去重、规范化）→ DWS（按指标聚合的中间结果）→ ADS（面向展示的结果表）。
 
-**物理四层已于 2026-09-03 达成**（开发日志 节点 6）：9 作业三层拓扑（Job1×3 / Job2×3 / Job3×3）全部 RUNNING。拆作业的关键收益：**指标只在 Job2 算一次**（拆前 ads 分支从 DWD 明细重复计算 = 每指标双份窗口/去重状态），Job3 读 DWS 聚合后的"当前绝对值" + 同主键覆盖写 MySQL → **无状态作业**（无窗口/去重/累计算子，重启秒级、重放天然幂等）。
+**物理四层已于 2026-09-03 达成**（开发日志 节点 6+8）：**11 作业三层拓扑**（Job1×3 / Job2×4 / Job3×4）全部 RUNNING。拆作业的关键收益：**指标只在 Job2 算一次**（拆前 ads 分支从 DWD 明细重复计算 = 每指标双份窗口/去重状态），Job3 读 DWS 聚合后的"当前绝对值" + 同主键覆盖写 MySQL → **无状态作业**（无窗口/去重/累计算子，重启秒级、重放天然幂等）。节点 8 后分钟指标补齐（分钟 UV / 交易分钟 GMV、订单数），分钟层共 4 指标 × 分钟窗口驱动趋势曲线。
 
 ---
 
@@ -129,6 +131,8 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 
 **红线**：禁止 `SUM(分钟UV)` 当日 UV、`SUM(分钟支付用户数)` 当日支付用户数、browse+click 混合当 PV。分钟指标与日指标天然不可加（同一用户可跨多个分钟窗口活跃），差异要在对账中写清楚，而不是消除。
 
+**分钟层补充指标（节点 8，锚点外"中间指标"，不参与日对账）**：分钟 UV（窗口内 browse 去重）、交易分钟 GMV / 支付订单数（TUMBLE 窗口，事件时间 = create_time 本地墙上时间）。分钟值用于趋势图；日锚点仍由日表独立兜底（红线同前）。
+
 ### 4.4 幂等性与可重放
 
 - 生成器确定性 → 同 seed 重放产出相同事件 → 批基准可复现（交易：MySQL 批 SQL + manifest；流量：生成器重放统计）。
@@ -158,19 +162,20 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | ------------------ | ------------ | -------- | -------- | -------------------------------------------------- |
 | ods_traffic_log    | ODS 行为日志 | 生成器   | JSON     | —                                                  |
 | dwd_traffic_event  | DWD 流量明细 | Job1     | changelog | event_id                                           |
-| dwd_payment_detail | DWD 支付明细 | Job1     | changelog | id（支付流水，非 order_id——同订单可多流水）        |
+| dwd_payment_detail | DWD 支付明细（CDC 原样）| Job1     | changelog | id（支付流水，非 order_id——同订单可多流水）        |
+| dwd_payment_detail_sorted | 支付明细按时间序重放版（节点8：重灌伪影→真实事件流）| replay 脚本 | changelog | 同上                               |
 | dwd_refund_detail  | DWD 退款明细 | Job1     | changelog | id（退款流水）                                     |
 | dws_traffic_1m     | DWS 流量分钟 | Job2     | Upsert   | metric_date+window_start+metric_name+dimension_key |
 | dws_traffic_day    | DWS 流量日   | Job2     | Upsert   | metric_date+metric_name+dimension_key              |
 | dws_trade_day      | DWS 交易日   | Job2     | Upsert   | 同上（无 window_start）                            |
-| dws_trade_1m       | 预留（交易分钟无作业写，扩展用）| —        | Upsert   | —                                                  |
+| dws_trade_1m       | DWS 交易分钟 | Job2     | Upsert   | metric_date+window_start+metric_name+dimension_key |
 
-（设计初稿中的 dwd_order_detail 未实现：订单明细 398 行留在 MySQL 源库，DWD 只做支付/退款两交易链路。）
+（设计初稿中的 dwd_order_detail 未实现：订单明细 398 行留在 MySQL 源库，DWD 只做支付/退款两交易链路。Job2 交易域消费 `dwd_payment_detail_sorted`——原因见 开发日志 节点 8：测试数据 id 流水号与支付时间错位 + CDC snapshot 主键扫描 → topic 内事件时间乱序 → 水位跳变丢窗口；重放工具 [scripts/replay_dwd_payment_sorted.sh](scripts/replay_dwd_payment_sorted.sh) 幂等可重跑。）
 
 ### 5.3 MySQL
 
 - **gmall_rt**（CDC 源库，9 表）：user_info / base_province / base_category / spu_info / sku_info / order_info / order_detail / payment_info / order_refund_info。binlog ROW + FULL + expire 30 天。
-- **gmall_report_rt**（结果库，DDL 4 表，实际写入 3 表）：ads_traffic_1m（33 窗口）/ ads_traffic_day / ads_trade_day 由 Job3 覆盖写；ads_trade_1m 预留无作业。
+- **gmall_report_rt**（结果库，DDL 4 表，实际写入 4 表）：ads_traffic_1m（33 窗口）/ ads_traffic_day / ads_trade_day / ads_trade_1m（162 窗口）由 Job3 覆盖写。
 
 ### 5.4 测试日数据（2026-09-01）
 
@@ -196,6 +201,7 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | 节点5 | **批流对账 6 指标总表**                                                                                   | **流 = 批 全 ✓**（含差异说明：分钟 636 vs 日 641 为尾部未触发窗口，预期差异非 bug）        |
 | 节点6 | **拆三作业**：Job2 精简为纯 DWS，Job3 无状态 sink（DWS→MySQL）                                            | 9 作业三层拓扑 RUNNING；MySQL 与拆前逐值一致（物理四层成立）                                |
 | 节点7 | **Grafana 看板**：provisioning 注册数据源 + 8 面板                                                       | 数据源/看板注册 ✓；代理查询取数 ✓（浏览器 localhost:3000 admin/admin）                     |
+| 节点8 | **分钟指标补齐**：流量分钟 UV + 交易分钟表 + 一键启动脚本                                                | 分钟 UV 33 窗口 627≤PV 636 ✓；交易分钟 **162 窗口** GMV 1,119,295.10 = 日 1,136,485.35 − 尾部单笔 17,190.25 ✓；抽 3 分钟窗口 vs MySQL 明细逐值相等 ✓（11 作业 RUNNING） |
 
 **过程中修掉的关键问题**（面试可讲，均记录在开发日志）：
 
@@ -207,16 +213,17 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 6. **共享 consumer group bug**：同一 SQL 文件双 INSERT = 两独立作业但共享 source group.id → partition 被一个作业独吞、另一个空转（dws 空 / ads 有）→ 每分支独立 group.id；教训：验证必须覆盖每条输出路径
 7. **UNION ALL 列名继承第一段**：首段无 `AS` 别名时列名退化为 EXPR$N → 外层引用报 not found；修复=首段显式别名
 8. 多分支 SQL 文件改动单个分支时不能整文件重跑（重复提交 → 同 group 瓜分）→ 抽单段单独提交
+9. **共享 consumer group 第二次踩**（节点8）：给既有文件的日 INSERT 旁加分钟 INSERT 时，直接复用了原 source DDL → 两个独立作业同 group → rebalance 中断分钟消费。教训：**同一文件每新增一个 INSERT 分支，其 source 必须再立一份 DDL + 独立 group.id**（job2_dwd 的日段 source 早独立，trade 加段时漏了）
+10. **事件时间乱序 → 水位跳变丢窗口**（节点8，最值钱）：CDC snapshot 按主键扫描输出，而测试数据 id 流水号与支付时间错位 → topic 内时间非单调 → 窗口只 fire 43 个（中午前）就停。分层排查法：非窗口日聚合对账正确 → 临时无窗口小时统计全量 ✓ → dump topic 时间序列见乱序 → 机制 = upsert-kafka 水位按物理消费序推进，先读到晚事件则其后早事件全被判"迟到"丢弃。修复 = 一次性按时间序重放成"真实事件流"（replay 工具，与流量 generator replay 同哲学）
 
 ---
 
 ## 7. 后续方向（当前里程碑已完成，均为可选项）
 
 1. ~~第 2 周计划~~ 已全部完成（交易 DWD、交易 DWS、日 PV/UV、批流对账、拆三作业、Grafana）
-2. 分钟 UV（中间指标，不参与日对账）、dws_trade_1m 分钟交易指标
-3. dwd_order_detail 订单明细 CDC（扩大交易域覆盖）
-4. 环境一键启动脚本（compose up + 灌数 + 提交作业）
-5. 学习向：README 锚点 ↔ 面试手册/SQL 错题册对照复习
+2. ~~分钟指标补齐（节点8）~~：分钟 UV（33 窗口）、dws_trade_1m 交易分钟（162 窗口）+ 一键启动脚本 scripts/start_env.sh
+3. dwd_order_detail 订单明细 CDC（扩大交易域覆盖，可选加分）
+4. 学习向：README 锚点 ↔ 面试手册/SQL 错题册对照复习（可选加分）
 
 ---
 
@@ -228,6 +235,8 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 ├── flink-lib/               # Flink connector jars（挂载到 /opt/flink/lib）
 ├── flink-sql/               # job1（ODS→DWD 三分支）/ job2（DWD→DWS）×2 / job3（DWS→ADS 无状态 sink）
 ├── scripts/submit_sql.sh    # 作业提交脚本（独立容器 + remote target）
+├── scripts/start_env.sh     # 环境一键启动（compose up + 健康/topic/作业检查，幂等）
+├── scripts/replay_dwd_payment_sorted.sh  # 交易支付按时间序重放（节点8，幂等）
 ├── data-generator/          # 行为日志生成器 V2 / 业务生成器 V2 + manifest
 ├── mysql/                   # business DDL、init、ads 结果库 DDL
 ├── grafana/                 # provisioning（数据源/看板声明式注册）

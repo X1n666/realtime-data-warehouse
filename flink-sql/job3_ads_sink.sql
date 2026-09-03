@@ -1,6 +1,7 @@
 -- =============================================================
 -- Job3: DWS -> ADS 无状态 sink（物理四层落库层，不碰计算）
--- 输入: Kafka dws_traffic_1m / dws_traffic_day / dws_trade_day（各自独立 group.id）
+-- 输入: Kafka dws_traffic_1m / dws_traffic_day / dws_trade_day / dws_trade_1m
+--       （各自独立 group.id）
 -- 输出: MySQL gmall_report_rt（JDBC upsert = INSERT ... ON DUPLICATE KEY UPDATE）
 -- 无状态论证（面试点，README/设计 V2 决策 6）：
 --   1. 读的是 DWS 聚合后的"当前绝对值"（upsert-kafka 同 key 已合并），
@@ -131,3 +132,45 @@ FROM dws_traffic_day;
 INSERT INTO ads_trade_day
 SELECT metric_date, metric_name, dimension_key, metric_value
 FROM dws_trade_day;
+
+-- 分支4: 交易分钟（topic 与 MySQL 表均预留，节点8 启用）
+CREATE TABLE dws_trade_1m (
+  metric_date   DATE,
+  window_start  TIMESTAMP(3),
+  metric_name   STRING,
+  dimension_key STRING,
+  metric_value  DECIMAL(18, 2),
+  PRIMARY KEY (metric_date, window_start, metric_name, dimension_key) NOT ENFORCED
+) WITH (
+  'connector' = 'upsert-kafka',
+  'topic' = 'dws_trade_1m',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'job3_ads_trade_1m_group',
+  'key.format' = 'json',
+  'value.format' = 'json'
+);
+
+CREATE TABLE ads_trade_1m (
+  metric_date   DATE,
+  window_start  TIMESTAMP(0),
+  metric_name   STRING,
+  dimension_key STRING,
+  metric_value  DECIMAL(18, 2),
+  PRIMARY KEY (metric_date, window_start, metric_name, dimension_key) NOT ENFORCED
+) WITH (
+  'connector' = 'jdbc',
+  'url' = 'jdbc:mysql://mysql:3306/gmall_report_rt?useSSL=false&serverTimezone=Asia/Shanghai',
+  'username' = 'root',
+  'password' = '123456',
+  'table-name' = 'ads_trade_1m',
+  'sink.buffer-flush.max-rows' = '1'
+);
+
+INSERT INTO ads_trade_1m
+SELECT
+  metric_date,
+  CAST(window_start AS TIMESTAMP(0)),
+  metric_name,
+  dimension_key,
+  metric_value
+FROM dws_trade_1m;
