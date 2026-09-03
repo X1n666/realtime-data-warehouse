@@ -57,16 +57,16 @@
 
 ## 3. 技术栈与选型理由
 
-| 组件 | 版本 | 为什么选它 |
-|---|---|---|
-| Flink | 1.19.1 | 真流引擎 + Flink SQL 降低实现成本；checkpoint/exactly-once 语义最完整；生态统一（Kafka/JDBC/CDC 都有官方 connector） |
-| Flink CDC | 3.1.1（flink-sql-connector-mysql-cdc） | 内置 binlog 订阅，**快照 + 增量一体化**（initial 模式先读全量再续增量，自动记录 binlog 位点），避免 Canal/MaxWell 需要额外部署一套服务 + 自维护位点的复杂度 |
-| MySQL | 8.0 | 业务源库（binlog ROW + FULL 行镜像，CDC 前置条件）；同时作为 ADS 结果库 |
-| Kafka | 3.7.1（KRaft 单节点） | ODS/DWD/DWS 之间解耦的消息通道；KRaft 省掉 Zookeeper，单节点也能跑；官方镜像 3.7 起发布 |
-| Upsert Kafka | — | 承接 changelog 流（+I/-D/-U/+U）：DWD 去重、DWS 聚合结果都含 update/delete 语义，append-only sink 会直接报错（Day4 实测踩坑） |
-| JDBC sink | flink-connector-jdbc 3.2.0-1.19 | 幂等写 MySQL：`INSERT ... ON DUPLICATE KEY UPDATE` 覆盖式 upsert，可重放不累加 |
-| Docker Compose | WSL2 单机 | 一键起全环境；限制每容器内存模拟资源受限场景；挂载 flink-lib 集成 connector jar |
-| Grafana | 11.1.0 | 指标可视化看板 |
+| 组件           | 版本                                   | 为什么选它                                                                                                                                                        |
+| -------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Flink          | 1.19.1                                 | 真流引擎 + Flink SQL 降低实现成本；checkpoint/exactly-once 语义最完整；生态统一（Kafka/JDBC/CDC 都有官方 connector）                                              |
+| Flink CDC      | 3.1.1（flink-sql-connector-mysql-cdc） | 内置 binlog 订阅，**快照 + 增量一体化**（initial 模式先读全量再续增量，自动记录 binlog 位点），避免 Canal/MaxWell 需要额外部署一套服务 + 自维护位点的复杂度 |
+| MySQL          | 8.0                                    | 业务源库（binlog ROW + FULL 行镜像，CDC 前置条件）；同时作为 ADS 结果库                                                                                           |
+| Kafka          | 3.7.1（KRaft 单节点）                  | ODS/DWD/DWS 之间解耦的消息通道；KRaft 省掉 Zookeeper，单节点也能跑；官方镜像 3.7 起发布                                                                           |
+| Upsert Kafka   | —                                     | 承接 changelog 流（+I/-D/-U/+U）：DWD 去重、DWS 聚合结果都含 update/delete 语义，append-only sink 会直接报错（Day4 实测踩坑）                                     |
+| JDBC sink      | flink-connector-jdbc 3.2.0-1.19        | 幂等写 MySQL：`INSERT ... ON DUPLICATE KEY UPDATE` 覆盖式 upsert，可重放不累加                                                                                  |
+| Docker Compose | WSL2 单机                              | 一键起全环境；限制每容器内存模拟资源受限场景；挂载 flink-lib 集成 connector jar                                                                                   |
+| Grafana        | 11.1.0                                 | 指标可视化看板                                                                                                                                                    |
 
 **明确不引入**（防止范围膨胀）：Doris / ClickHouse / Paimon（OLAP 或湖格式，资源与学习阶段不必要）、Canal/MaxWell（额外服务）、HBase/Redis（维表缓存暂用 Flink 状态）。
 
@@ -103,22 +103,22 @@
 
 binlog 实测事件形态（ROW 格式下每行一个事件）：
 
-| 事务 | 事件 |
-|---|---|
-| 段1 | 3 表 Write_rows（user 100 / order 200 / detail 398） |
-| 段2 | 170 × Update_rows(order_info) + Write_rows(payment_info 182) |
-| 段3 | 12 × Update_rows(order_info) + Write_rows(order_refund_info 12) |
+| 事务 | 事件                                                             |
+| ---- | ---------------------------------------------------------------- |
+| 段1  | 3 表 Write_rows（user 100 / order 200 / detail 398）             |
+| 段2  | 170 × Update_rows(order_info) + Write_rows(payment_info 182)    |
+| 段3  | 12 × Update_rows(order_info) + Write_rows(order_refund_info 12) |
 
 ### 4.3 指标口径锚点（固定 6 项，禁止漂移）
 
-| # | 指标 | 口径 | 对账方式 |
-|---|---|---|---|
-| 1 | PV | browse 事件数 | 批 SQL：COUNT(*) browse |
-| 2 | 分钟 UV | 窗口内 browse 用户去重（中间指标） | 不参与日对账 |
-| 3 | 日 UV | 自然日内 browse 用户**独立重新去重** | 批 SQL：COUNT(DISTINCT uid) |
-| 4 | GMV | SUCCESS 支付金额，按支付时间，**不减退款** | 批 SQL 第 4 节 |
-| 5 | 支付订单数 | DISTINCT order_id（支付流水） | 同上 |
-| 6 | 日支付用户数 | 自然日内 DISTINCT user_id（支付流水） | 同上 |
+| # | 指标         | 口径                                             | 对账方式                    |
+| - | ------------ | ------------------------------------------------ | --------------------------- |
+| 1 | PV           | browse 事件数                                    | 批 SQL：COUNT(*) browse     |
+| 2 | 分钟 UV      | 窗口内 browse 用户去重（中间指标）               | 不参与日对账                |
+| 3 | 日 UV        | 自然日内 browse 用户**独立重新去重**       | 批 SQL：COUNT(DISTINCT uid) |
+| 4 | GMV          | SUCCESS 支付金额，按支付时间，**不减退款** | 批 SQL 第 4 节              |
+| 5 | 支付订单数   | DISTINCT order_id（支付流水）                    | 同上                        |
+| 6 | 日支付用户数 | 自然日内 DISTINCT user_id（支付流水）            | 同上                        |
 
 **红线**：禁止 `SUM(分钟UV)` 当日 UV、`SUM(分钟支付用户数)` 当日支付用户数、browse+click 混合当 PV。分钟指标与日指标天然不可加（同一用户可跨多个分钟窗口活跃），差异要在对账中写清楚，而不是消除。
 
@@ -133,27 +133,27 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 
 ### 5.1 Docker Compose（内存预算 ≈ 5.75G）
 
-| 容器 | 镜像 | 资源 | 端口 |
-|---|---|---|---|
-| gmall_mysql | mysql:8.0 | 1G | 3306 |
-| gmall_kafka | apache/kafka:3.7.1 | 1.5G | 29092（主机） |
-| gmall_jobmanager | flink:1.19.1 | 768M | 8081 |
-| gmall_taskmanager | flink:1.19.1 | 2G，**4 slots** | — |
-| gmall_grafana | grafana/grafana:11.1.0 | 512M | 3000 |
+| 容器              | 镜像                   | 资源                  | 端口          |
+| ----------------- | ---------------------- | --------------------- | ------------- |
+| gmall_mysql       | mysql:8.0              | 1G                    | 3306          |
+| gmall_kafka       | apache/kafka:3.7.1     | 1.5G                  | 29092（主机） |
+| gmall_jobmanager  | flink:1.19.1           | 768M                  | 8081          |
+| gmall_taskmanager | flink:1.19.1           | 2G，**4 slots** | —            |
+| gmall_grafana     | grafana/grafana:11.1.0 | 512M                  | 3000          |
 
 flink-lib/ 挂载 17 个 jar（flink-dist + mysql-cdc / kafka / jdbc / mysql-connector-j）。
 
 ### 5.2 Kafka Topic
 
-| Topic | 语义 | 格式 | 主键 |
-|---|---|---|---|
-| ods_traffic_log | ODS 行为日志 | JSON | — |
-| dwd_traffic_event | DWD 流量明细 | JSON（清洗后） | event_id |
-| dwd_payment_detail | DWD 支付明细 | changelog | 待设计（见第 7 节任务） |
-| dwd_refund_detail | DWD 退款明细 | changelog | 同上 |
-| dwd_order_detail | DWD 订单明细 | changelog | 同上 |
-| dws_traffic_1m | DWS 流量分钟 | **Upsert** | metric_date+window_start+metric_name+dimension_key |
-| dws_trade_1m | DWS 交易分钟 | **Upsert** | 同上 |
+| Topic              | 语义         | 格式             | 主键                                               |
+| ------------------ | ------------ | ---------------- | -------------------------------------------------- |
+| ods_traffic_log    | ODS 行为日志 | JSON             | —                                                 |
+| dwd_traffic_event  | DWD 流量明细 | JSON（清洗后）   | event_id                                           |
+| dwd_payment_detail | DWD 支付明细 | changelog        | 待设计（见第 7 节任务）                            |
+| dwd_refund_detail  | DWD 退款明细 | changelog        | 同上                                               |
+| dwd_order_detail   | DWD 订单明细 | changelog        | 同上                                               |
+| dws_traffic_1m     | DWS 流量分钟 | **Upsert** | metric_date+window_start+metric_name+dimension_key |
+| dws_trade_1m       | DWS 交易分钟 | **Upsert** | 同上                                               |
 
 （dws_*_day 两个日级 topic 第 2 周建）
 
@@ -171,12 +171,12 @@ flink-lib/ 挂载 17 个 jar（flink-dist + mysql-cdc / kafka / jdbc / mysql-con
 
 ## 6. 已完成的进度与验证结果
 
-| 阶段 | 内容 | 验证结果 |
-|---|---|---|
-| Day 1 | 环境：MySQL binlog(ROW/FULL/30天)、Kafka 产消、Flink 1 TM、A1-A5 从离线仓库复制改造 | MySQL healthy + binlog 参数实测；Kafka 产消通过 |
-| Day 2 | 生成器 V2（event_id/--offset/event_time_ms/biz_date/source_timezone）+ ODS 2000 条 | Flink SQL 消费 COUNT=2000 且 DISTINCT event_id=2000 一致 |
-| Day 3 | gmall_rt 9 表 + 静态维度；业务生成器三阶段交易改造；manifest；binlog 三段验证；CDC source 测试 | 行数验收 200/398/182/12；binlog TXN7/8/9 三段独立事务；CDC 全量快照 payment 182 行 |
-| Day 4 | Job1（ods→dwd 去重清洗）+ Job2（1m 窗口 browse PV → dws + ads） | 3 作业 RUNNING；ads_traffic_1m 33 个完整窗口；**PV 对账 641 = 636(已触发) + 5(尾部未触发窗口)** |
+| 阶段  | 内容                                                                                           | 验证结果                                                                                              |
+| ----- | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Day 1 | 环境：MySQL binlog(ROW/FULL/30天)、Kafka 产消、Flink 1 TM、A1-A5 从离线仓库复制改造            | MySQL healthy + binlog 参数实测；Kafka 产消通过                                                       |
+| Day 2 | 生成器 V2（event_id/--offset/event_time_ms/biz_date/source_timezone）+ ODS 2000 条             | Flink SQL 消费 COUNT=2000 且 DISTINCT event_id=2000 一致                                              |
+| Day 3 | gmall_rt 9 表 + 静态维度；业务生成器三阶段交易改造；manifest；binlog 三段验证；CDC source 测试 | 行数验收 200/398/182/12；binlog TXN7/8/9 三段独立事务；CDC 全量快照 payment 182 行                    |
+| Day 4 | Job1（ods→dwd 去重清洗）+ Job2（1m 窗口 browse PV → dws + ads）                              | 3 作业 RUNNING；ads_traffic_1m 33 个完整窗口；**PV 对账 641 = 636(已触发) + 5(尾部未触发窗口)** |
 
 **过程中修掉的关键问题**（面试可讲）：
 
