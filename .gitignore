@@ -1,0 +1,6 @@
+# Python
+__pycache__/
+*.pyc
+
+# 生成器数据产物：MySQL 备份（确定性可重现——同 seed 重放可再生成，重灌方法见 docs/开发日志.md）
+data-generator/data/generated/*_backup_*.sql
