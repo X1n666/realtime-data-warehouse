@@ -2,6 +2,10 @@
   "uid": "rt-realtime-overview",
   "title": "电商实时数仓 · 实时指标总览",
   "timezone": "Asia/Shanghai",
+  "time": {
+    "from": "2026-09-01T00:00:00.000Z",
+    "to": "2026-09-02T00:00:00.000Z"
+  },
   "schemaVersion": 39,
   "version": 1,
   "refresh": "30s",
@@ -284,7 +288,7 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT metric_date, metric_name, metric_value FROM ads_trade_day WHERE metric_date >= DATE_SUB(CURDATE(), INTERVAL 3 DAY) UNION ALL SELECT metric_date, metric_name, metric_value FROM ads_traffic_day WHERE metric_date >= DATE_SUB(CURDATE(), INTERVAL 3 DAY) ORDER BY metric_date DESC, metric_name",
+          "rawSql": "SELECT metric_date, metric_name, metric_value FROM ads_trade_day WHERE metric_date >= DATE_SUB((SELECT MAX(metric_date) FROM ads_trade_day), INTERVAL 3 DAY) UNION ALL SELECT metric_date, metric_name, metric_value FROM ads_traffic_day WHERE metric_date >= DATE_SUB((SELECT MAX(metric_date) FROM ads_traffic_day), INTERVAL 3 DAY) ORDER BY metric_date DESC, metric_name",
           "datasource": {
             "type": "mysql",
             "uid": "mysql-rt"
