@@ -4,3 +4,7 @@ __pycache__/
 
 # 生成器数据产物：MySQL 备份（确定性可重现——同 seed 重放可再生成，重灌方法见 docs/开发日志.md）
 data-generator/data/generated/*_backup_*.sql
+
+# Flink 二进制依赖（~230MB，flink-dist 单文件 121MB 超 GitHub 100MB 限制）
+# 不入库，clone 后跑 scripts/fetch_flink_lib.sh 重建（脚本幂等）
+flink-lib/*.jar

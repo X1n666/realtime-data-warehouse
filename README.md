@@ -13,7 +13,7 @@
 **为什么做这个项目**（秋招导向）：
 
 - 覆盖大数据开发岗位的核心面试点：分层建模、事件时间与 watermark、窗口、状态与去重、checkpoint、CDC/changelog、Upsert 幂等、批流对账、故障恢复。
-- 简历亮点（当前状态即可这样写）：**物理四层实时数仓**（Job1 接入 / Job2 DWS / Job3 无状态 sink，**11 作业**全 RUNNING）、Flink CDC 交易链路、三阶段交易生命周期可复现对账、**6 指标批流全对 + 分钟级 UV/GMV 趋势逐值对账**、环境一键启动复现。
+- 简历亮点（当前状态即可这样写）：**物理四层实时数仓**（Job1 接入 ×4 / Job2 DWS ×4 / Job3 无状态 sink ×4，**12 作业**全 RUNNING）、Flink CDC 交易链路（下单/支付/退款三阶段生命周期）、**日口径 9 项指标流批逐值对账分毫不差 + 分钟级 UV/GMV 逐值对账**、环境一键启动复现。
 
 ---
 
@@ -161,7 +161,7 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 
 - 全部容器 `restart: unless-stopped`；mysql/kafka 数据挂 **named volume**（Docker 意外退出不丢数据，2026-08-24 两次丢失教训）。
 - `name: ecommerce-realtime-data-warehouse` 固定 compose 项目名（目录为中文名，防默认项目名漂移导致网络名变化）。
-- flink-lib/ 挂载 connector jars（mysql-cdc / kafka / jdbc / mysql-connector-j 等）。
+- flink-lib/ 挂载 connector jars（17 个 = 13 个 Flink 发行版自带 + 4 个外挂：mysql-cdc / kafka / jdbc / mysql-connector-j）。**jar 为二进制依赖不入库**（合计 ~230MB，其中 flink-dist 单文件 121MB 超 GitHub 100MB 硬限制）——clone 后由 [scripts/fetch_flink_lib.sh](scripts/fetch_flink_lib.sh) 幂等重建：13 个从 `flink:1.19.1` 镜像 `docker cp` 提取（版本与镜像锁定），4 个从 Maven Central 下载；`start_env.sh` 检测到缺失会自动调用。
 
 ### 5.2 Kafka Topic（实际已建）
 
@@ -260,13 +260,32 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 
 ---
 
-## 9. 目录结构
+## 9. 快速开始（clone 后如何跑起来）
+
+```bash
+# 1) 重建 Flink 依赖 jar（首次必跑；start_env.sh 检测缺失也会自动调用）
+bash scripts/fetch_flink_lib.sh     # 13 个从 flink:1.19.1 镜像提取 + 4 个 Maven 下载
+
+# 2) 一键启动：compose up → 健康等待 → topic 检查 → 作业补齐提交（按依赖序）
+bash scripts/start_env.sh           # 幂等可重跑；环境重建后加 --full 触发数据重放
+
+# 3) 打开面板
+#    看板   http://localhost:3000   （admin / admin，本地测试凭据）
+#     Flink  http://localhost:8081   （12 作业应全 RUNNING）
+```
+
+前提：Docker Desktop + WSL2（内存建议 ≥8GB）、bash（Git Bash 可用）、curl。首次启动需拉取镜像（MySQL/Kafka/Flink/Grafana）并执行 MySQL 初始化脚本，请留出几分钟。结果表 DDL 在 [mysql/ads_result_rt_ddl.sql](mysql/ads_result_rt_ddl.sql)，MySQL 卷丢失后需重跑（见 §5.3）。
+
+---
+
+## 10. 目录结构
 
 ```
 实时数据分析平台/            # 项目根目录（中文名；compose 已用 name: 字段固定项目名）
 ├── docker-compose.yml       # 全环境编排（MySQL/Kafka/Flink/Grafana + named volume + restart）
-├── flink-lib/               # Flink connector jars（挂载到 /opt/flink/lib）
-├── flink-sql/               # job1（ODS→DWD 三分支）/ job2（DWD→DWS）×2 / job3（DWS→ADS 无状态 sink）
+├── flink-lib/               # Flink connector jars（挂载到 /opt/flink/lib；jar 不入库，见 §9 重建）
+├── flink-sql/               # job1（ODS→DWD 四分支）/ job2（DWD→DWS）×2 / job3（DWS→ADS 无状态 sink）
+├── scripts/fetch_flink_lib.sh  # 重建 flink-lib（镜像提取 13 + Maven 下载 4，幂等）
 ├── scripts/submit_sql.sh    # 作业提交脚本（独立容器 + remote target）
 ├── scripts/start_env.sh     # 环境一键启动（compose up + 健康/topic/作业检查，幂等）
 ├── scripts/replay_dwd_payment_sorted.sh  # 交易支付按时间序重放（节点8，幂等）

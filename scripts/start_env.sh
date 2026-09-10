@@ -32,6 +32,14 @@ say()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$1"; }
 warn() { printf '\033[1;33m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$1"; }
 err()  { printf '\033[1;31m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$1"; exit 1; }
 
+# ---------- 0.5 flink-lib 依赖检查（jar 不入库，clone 后需重建） ----------
+# flink-dist 单文件 121MB 超 GitHub 100MB 限制，二进制依赖整体不入库；
+# 缺失时自动重建（fetch 脚本幂等，已存在的 jar 会跳过）
+if ! ls flink-lib/flink-dist-*.jar >/dev/null 2>&1; then
+  say "0/6 flink-lib 缺失 -> 自动重建（scripts/fetch_flink_lib.sh）..."
+  bash scripts/fetch_flink_lib.sh
+fi
+
 # ---------- 1. compose 拉起 ----------
 say "1/6 docker compose up -d ..."
 docker compose up -d
