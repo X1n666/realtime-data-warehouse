@@ -342,13 +342,20 @@ bash scripts/start_env.sh --full    # 冷启动/环境重建：完整恢复链�
 顺序不能调换（第 ⑤ 步是上一节那个删除/重建竞态的直接推论）：
 
 ```text
+⓪ 先 cancel 全部   —— ② 和 ⑤ 要删的 topic 都有在线消费者，删不掉（auto-create 竞态）
 ① MySQL 源库       scripts/load_mysql_source.sh         交易域唯一数据源；空库 = 全链路静默零指标
 ② 流量源 topic     scripts/replay_traffic.sh            确定性重放 2000 行（同 seed 两次 md5 一致）
 ③ 只提 job1        —— 两条源链的共同上游（流量加工 + CDC 全量快照）
 ④ 等源链灌出       dwd_traffic_event ≥2000 且 dwd_payment_detail ≥182（各等稳定 10s）
 ⑤ 重排交易 topic   scripts/replay_dwd_payment_sorted.sh 必须在提交下游作业**之前**做
                      有消费者在线时删除永远完不成（60s 一轮重建循环），无消费者时 1 秒生效
+（第 5 步）按依赖序重提全部 14 个作业
 ```
+
+⓪ 不是可选项：② 要删 `ods_traffic_log`（job1 订阅），⑤ 要删 `dwd_payment_detail_sorted`
+（job2/job4 订阅），消费者在线时这两次删除都完不成。所以先整体 cancel 一次，把"没有消费者
+在线"从**隐含前提**变成**脚本自己保证的条件** —— 这样 `--full` 在冷启动和**运行中**都能跑，
+不必先手动停作业。这也正是开发日志 节点10 那条已验收的恢复套路（先全灭、再按依赖序重提）。
 
 ④ 的期望值容易被写错：**冷启动是 2000，不是 12000**。job1 的 source 写死 `earliest-offset`，
 每提交一次就重放一遍全量 → topic 里会累积 N 份历史副本（当前实测 12000 = 6 次 × 2000）；

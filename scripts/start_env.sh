@@ -12,11 +12,18 @@
 #   文件重提（先 cancel 同名残留，避免同 group 多作业消费冲突，见开发日志 节点2）
 #
 # --full 的顺序是**有依赖的，别调换**（依据见各步注释）：
-#   ① MySQL 源库 → ② 流量源 topic → ③ 只提 job1 → ④ 等源链灌出 → ⑤ 重排交易 topic
-#   关键点：⑤（删除并重建 topic）必须在**下游作业提交之前**做，
+#   ⓪ 先 cancel 全部作业 → ① MySQL 源库 → ② 流量源 topic → ③ 只提 job1
+#   → ④ 等源链灌出 → ⑤ 重排交易 topic → （第 5 步）再按依赖序重提全部
+# 关键点：⑤（删除并重建 topic）必须在**下游作业提交之前**做，
 #   否则在线消费者的 metadata 请求会触发 Kafka auto-create 把 topic 立刻重建为空，
 #   删除永远完不成（实测：有消费者在线时是 60s 一轮的删除/重建循环，
 #   无消费者时删除 1 秒生效）→ 见 scripts/replay_dwd_payment_sorted.sh 文件头。
+# ⓪ 就是为这条服务的：② 和 ⑤ 各要删除一个"有在线消费者"的 topic
+#   （② 删 ods_traffic_log ← job1 订阅；⑤ 删 dwd_payment_detail_sorted ← job2/job4 订阅），
+#   所以 --full 先整体 cancel 一次，让"没有消费者在线"从**隐含前提**变成**自己保证的条件**——
+#   不这么做的话，运行中执行 --full 会撞上删除/重建竞态（⑤ 硬失败退出 1）。
+#   这也是开发日志 节点10 那条已验收的恢复套路（先全灭、再按依赖序重提），
+#   因此 --full 在冷启动和运行中**都能跑**，不需要用户先手动停作业。
 # =============================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -183,6 +190,11 @@ MSYS_NO_PATHCONV=1 docker exec gmall_kafka sh -c '
 # ---------- 4. [--full] 冷启动重建链 ----------
 if [ "$MODE" = "--full" ]; then
   say "4/7 [--full] 冷启动重建链（顺序有依赖，见文件头）..."
+  # ⓪ 先 cancel 全部：② 和 ⑤ 要删除的两个 topic 都有在线消费者（job1 / job2 / job4），
+  #    消费者在线时删除永远完不成（auto-create 竞态）。先整体停掉，第 5 步会按依赖序重提。
+  say "  ⓪ cancel 全部作业（让下面两次 topic 重建不必和在线消费者赛跑）..."
+  for sql in "${SQL_ORDER[@]}"; do cancel_name "${sql%.sql}"; done
+  sleep 5
   say "  ① MySQL 源库（交易域唯一数据源）..."
   bash scripts/load_mysql_source.sh
   say "  ② 流量源 topic 重放（流量域只在 Kafka，无批表可捞）..."
