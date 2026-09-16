@@ -210,6 +210,7 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 - 全部容器 `restart: unless-stopped`（init 容器是一次性的 `restart: "no"`，JM/TM 用 `depends_on: service_completed_successfully` 等它跑完）。
 - **`flink-checkpoints` 命名卷**（2026-09-16）：JM/TM 同卷同路径 `/opt/flink/checkpoints`，checkpoint 落盘。因 Docker 给新挂载点的属主是 `root:root` 而 flink 镜像 PID 1 降权到 `flink`，需 init 容器先 `chown`（详见 §4.5）。
 - ⚠️ **`kafka-data` 卷目前是无效的（已知缺陷，待修）**：Kafka 实际写 `/tmp/kafka-logs`（实测 14 MB 真实数据），而卷挂在 `/tmp/kraft-combined-logs`（4 KB 空目录）→ **持久化没生效，所有 topic 数据在容器可写层**，任何 `recreate`/`down` 会静默清空。自检命令：`docker exec gmall_kafka du -sh /tmp/kafka-logs /tmp/kraft-combined-logs`。修复需重建 Kafka 容器（先迁移数据），**尚未实施**——排查过程见 [开发日志](docs/开发日志.md)。
+  **⚠️ 与保留期缺陷的耦合（重要）**：因为重建会清空 topic，所以"改 Kafka 的 env 配置"这条路现在是**被封死**的——任何 env 改动都会触发容器重建（`up -d --dry-run` 可验证）。所以保留期修复**刻意没有**走 `KAFKA_LOG_RETENTION_HOURS`，改用不需要重建的两层（topic 级 + broker 动态配置 + `start_env.sh` 幂等收敛），详见 §6 难点 13。等卷修复完成时再一起加回 compose。
 - mysql 数据挂 named volume（Docker 意外退出不丢数据，2026-08-24 两次丢失教训）——**这一条对 MySQL 成立，对 Kafka 不成立**（见上条）。
 - `name: ecommerce-realtime-data-warehouse` 固定 compose 项目名（目录为中文名，防默认项目名漂移导致网络名变化）。
 - flink-lib/ 挂载 connector jars（17 个 = 13 个 Flink 发行版自带 + 4 个外挂：mysql-cdc / kafka / jdbc / mysql-connector-j）。**jar 为二进制依赖不入库**（合计 ~230MB，其中 flink-dist 单文件 121MB 超 GitHub 100MB 硬限制）——clone 后由 [scripts/fetch_flink_lib.sh](scripts/fetch_flink_lib.sh) 幂等重建：13 个从 `flink:1.19.1` 镜像 `docker cp` 提取（版本与镜像锁定），4 个从 Maven Central 下载；`start_env.sh` 检测到缺失会自动调用。
@@ -264,6 +265,7 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 | 节点9 | **看板分钟层补齐**：9 面板（PV/UV 双系列 + 分钟 GMV 曲线）                                                | API 验证：9 面板注册 ✓；GMV 序列 162 行 / UV 33 行取数 ✓（浏览器 localhost:3000 admin/admin）                                          |
 | 节点10 | **下单侧链路（加分）**：Job1 加订单明细 CDC 分支（server-id 5420-5424）→ dwd_order_detail；Job2 交易日聚合 +3 指标（下单金额/单数/明细行数）；start_env.sh 支持 Job1×4 | **7/7 流=批 ✓**（下单金额 1,334,596.00 / 200 单 / 398 明细行；旧 4 指标 1,136,485.35/182/83/退款按日不变；分钟层 162/33 窗口完好）12 作业 RUNNING（Job1×4/Job2×4/Job3×4） |
 | 节点11 | **维度建模（Lookup Join）**：Job4×2 用链式 lookup 补维度（`payment→order_info→base_province`、`order_detail→sku_info→base_category`）→ 分省 GMV / 分品类下单金额；slot 12→14 | **11/11 流=批 ✓**（`gmv_province` 12 省合计 1,136,485.35、`order_amount_category` 9 品类合计 1,334,596.00 = **维度求和回日锚点**，同时证明 join 基数不丢不重）。两条约束 EXPLAIN 实证：`FOR SYSTEM_TIME AS OF` 只能引用左表时间属性；JDBC 维表**不是版本表** → 事件时间 temporal join 用不了，只能 `PROCTIME()`。踩到「空 topic 静默空读」（见下方难点 12） |
+| 节点12 | **保留期静默删源数据 + 冷启动恢复链**：哨兵报出 `ods_traffic_log` 的 `earliest=latest=2000`（不是 0）；broker 日志证实是保留期到期删除；修复三层（topic 级 / broker 动态 / 启动幂等收敛）且**刻意绕开会触发容器重建的 compose env**；补齐 `--full` 五步恢复链 + 两个新脚本；修掉 compose 里空的 MySQL init 目录 | 抢救时 9 个 topic 距失效只剩 **79 分钟**；淘汰全程静默（topic 在、13 消费组 **lag 全 0**、14 作业 RUNNING、看板数字全对）。恢复链实测：重放确定性 md5 一致、`browse=641` = 日锚点；`dwd_traffic_event` 12000→**14000**（真重放）但锚点逐行不变（历史事件被判迟到丢弃）。MySQL 容器重建前后 11 项锚点**逐行 diff 一致** |
 
 **过程中修掉的关键问题**（面试可讲，均记录在开发日志）：
 
@@ -280,7 +282,9 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 11. **误双提 + 异步 cancel 竞赛 → 作业风暴**（节点10）：提交命令笔误执行两次 → 同 server-id 的 CDC 作业互相踢下线 → 15 个 RUNNING/RESTARTING 循环，cancel 与 restart 赛跑清不掉 → 正确恢复 = **重启 jobmanager**（standalone 无 HA，作业全灭，数据在 Kafka/MySQL 不丢）→ 按依赖序一键重提 12 作业。教训：CDC 多作业必须分段 server-id，恢复用"全灭重建"而不是逐 job cancel；另修复 start_env.sh CRLF 坑（Windows docker.exe 管道输出 CRLF 化 → URL 混入 \r，curl exit 3）
 12. **空 topic 静默空读**（节点11，**最难查**）：job4 省份分支零输出，作业却 `RUNNING`、无异常、指标为 0。三次假设被证据依次推翻（默认 startup mode → `auto.offset.reset` 实为 earliest → topic 本身就是空的 `earliest=latest=182`），真因在 **broker 日志**：① `auto.create.topics.enable=true` + **订阅它的消费者在线** → 任何 metadata 请求都会把刚删掉的 topic **自动重建为空 topic**；② topic 删除是**异步**的，实测耗时 **整 60 秒**；③ committed offset 落在新 topic 合法区间内（正好 = 末尾）→ 不回退。**复现实验钉死归因**：消费者在线时删除永远完不成（60s 一轮循环），cancel 掉订阅它的 4 个作业后**删除 1 秒完成**。
     **连带挖出更严重的隐患**：`du -sh` 对比发现 Kafka 实际写 `/tmp/kafka-logs`（14 MB 真实数据），而 `kafka-data` 卷挂在 `/tmp/kraft-combined-logs`（4 KB 空目录）→ **持久化根本没生效，所有 topic 数据在容器可写层**，任何 `recreate`/`down` 会静默清空（auto-create 会把"数据没了"伪装成"topic 正常"）。
-    **两条方法学教训**：① 别用聚合指标代替日志——曾据 source 顶点 `write-records=0` 误判"CDC 没读"，而 TM 日志写着 `Finished exporting 182 records for split 'gmall_rt.payment_info:0'`；② **锚点一致 ≠ 这次算出来的**——`dws_trade_day` 是 upsert topic，旧值一直躺在 Kafka 里，链路没重算时 job3 会把旧值原样转发进 MySQL、锚点照样全对。核验重算要看**过程证据**（消费组位点 / source 读入量），更严的做法是先清空下游 topic 再重算（clean-room）。已把「空 topic 哨兵」写进 `start_env.sh` 第 4.5 步。
+    **两条方法学教训**：① 别用聚合指标代替日志——曾据 source 顶点 `write-records=0` 误判"CDC 没读"，而 TM 日志写着 `Finished exporting 182 records for split 'gmall_rt.payment_info:0'`；② **锚点一致 ≠ 这次算出来的**——`dws_trade_day` 是 upsert topic，旧值一直躺在 Kafka 里，链路没重算时 job3 会把旧值原样转发进 MySQL、锚点照样全对。核验重算要看**过程证据**（消费组位点 / source 读入量），更严的做法是先清空下游 topic 再重算（clean-room）。已把「空 topic 哨兵」写进 `start_env.sh`（只查上游 6 个 topic：`dws_*` 是作业产出、刚提交时窗口还没闭合，查它会误报）。
+13. **Kafka 保留期静默删源数据**（节点12，**危害最大**）：哨兵报出 `ods_traffic_log` 的 `earliest=latest=2000`——注意**不是 0**：`=0` 是"从没写过"，`=2000` 是"**写过、后来被删了**"（log start offset 前移、段文件没了）。broker 日志一句话定案：`Deleting segment ... due to log retention time 604800000ms breach based on the largest record timestamp in the segment`。**关键语义**：`message.timestamp.type=CreateTime` → 保留期按**消息自身时间戳**算，而记录时间戳 = **producer 写入那一刻**（重放脚本的 `--ts 2026-09-01` 只写进消息体，不是记录时间戳）→ 这套"固定历史测试日"的数据集**写入满 7 天必被删**。之所以一直没暴露：broker 停机跨过了 7 天界限，cleaner（5 分钟一轮）没机会跑；09-16 02:24 容器一启动，33 秒后补删。**差点砍在演示上**：发现时 `dwd_traffic_event` 等 9 个 topic 的 7 天失效点是当天 04:59 UTC，而当时 03:40 —— **只差 79 分钟**；且淘汰过程全静默（topic 还在、13 个消费组 lag 全 0、14 作业 RUNNING、checkpoint 照常、**MySQL 里的指标还是旧值 → 看板数字看起来完全正确**）。
+    修复分三层且**刻意绕开"必须重建容器"那条路**：topic 级 `retention.ms=-1`（10 个）+ broker 动态 `log.retention.ms=-1`（`log.retention.hours` 不能动态改）+ `start_env.sh` 每次启动幂等收敛。`KAFKA_LOG_RETENTION_HOURS: "-1"` 才是根治，但**故意在 compose 里注释掉**——加它会触发 Kafka 容器重建（`--dry-run` 实测），而 `kafka-data` 卷挂错路径 → 重建 = 清空全部 topic（**正是刚抢救回来的那批**）。避免"顺手加一行配置"变成"下次启动清库"。
 
 ---
 
@@ -321,15 +325,39 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 # 1) 重建 Flink 依赖 jar（首次必跑；start_env.sh 检测缺失也会自动调用）
 bash scripts/fetch_flink_lib.sh     # 13 个从 flink:1.19.1 镜像提取 + 4 个 Maven 下载
 
-# 2) 一键启动：compose up → 健康等待 → topic 检查 → 作业补齐提交（按依赖序）
-bash scripts/start_env.sh           # 幂等可重跑；环境重建后加 --full 触发数据重放
+# 2) 一键启动：compose up → 健康等待 → 数据源体检 → 作业补齐提交（按依赖序）
+bash scripts/start_env.sh           # 幂等可重跑（不动数据，只补作业）
+bash scripts/start_env.sh --full    # 冷启动/环境重建：完整恢复链（见下）
 
 # 3) 打开面板
 #    看板   http://localhost:3000   （admin / admin，本地测试凭据）
 #     Flink  http://localhost:8081   （14 作业应全 RUNNING）
 ```
 
-前提：Docker Desktop + WSL2（内存建议 ≥8GB）、bash（Git Bash 可用）、curl。首次启动需拉取镜像（MySQL/Kafka/Flink/Grafana）并执行 MySQL 初始化脚本，请留出几分钟。结果表 DDL 在 [mysql/ads_result_rt_ddl.sql](mysql/ads_result_rt_ddl.sql)，MySQL 卷丢失后需重跑（见 §5.3）。
+前提：Docker Desktop + WSL2（内存建议 ≥8GB）、bash（Git Bash 可用）、curl。首次启动需拉取镜像（MySQL/Kafka/Flink/Grafana）并执行 MySQL 初始化脚本，请留出几分钟。MySQL 初始化脚本由 compose 按 `01→04` 数字前缀挂进 `/docker-entrypoint-initdb.d`（建业务表 → 维度种子 → 交易数据 → 实时结果表），**仅在数据目录为空时执行**；已有数据的卷不会重跑，需重灌时用 [scripts/load_mysql_source.sh](scripts/load_mysql_source.sh)。
+
+### 冷启动 / 环境重建：`--full` 恢复链
+
+数据源分布在两处（交易域只在 MySQL、流量域只在 Kafka），**两处都得先重建再启作业**，
+顺序不能调换（第 ⑤ 步是上一节那个删除/重建竞态的直接推论）：
+
+```text
+① MySQL 源库       scripts/load_mysql_source.sh         交易域唯一数据源；空库 = 全链路静默零指标
+② 流量源 topic     scripts/replay_traffic.sh            确定性重放 2000 行（同 seed 两次 md5 一致）
+③ 只提 job1        —— 两条源链的共同上游（流量加工 + CDC 全量快照）
+④ 等源链灌出       dwd_traffic_event ≥2000 且 dwd_payment_detail ≥182（各等稳定 10s）
+⑤ 重排交易 topic   scripts/replay_dwd_payment_sorted.sh 必须在提交下游作业**之前**做
+                     有消费者在线时删除永远完不成（60s 一轮重建循环），无消费者时 1 秒生效
+```
+
+④ 的期望值容易被写错：**冷启动是 2000，不是 12000**。job1 的 source 写死 `earliest-offset`，
+每提交一次就重放一遍全量 → topic 里会累积 N 份历史副本（当前实测 12000 = 6 次 × 2000）；
+副本无害（下游 upsert 读法是"每 key 取最新"），但等待阈值必须按**单次重放量**写。
+
+`replay_traffic.sh` 的忠实性校验：生成器自报 **browse=641**，与已验收的日锚点 `browse_pv=641`
+完全吻合 —— 证明重放是**忠实重建**，不是"随便造点数据把看板填满"。两个重放脚本创建 topic 时
+都显式带 `--config retention.ms=-1`：topic 级配置在重建时会全部丢失，不显式给就退回 broker
+默认 168 小时，写入满 7 天后会被**静默删除**（见 §6 难点 13）。
 
 ---
 
@@ -339,10 +367,12 @@ bash scripts/start_env.sh           # 幂等可重跑；环境重建后加 --ful
 实时数据分析平台/            # 项目根目录（中文名；compose 已用 name: 字段固定项目名）
 ├── docker-compose.yml       # 全环境编排（MySQL/Kafka/Flink/Grafana + named volume + restart）
 ├── flink-lib/               # Flink connector jars（挂载到 /opt/flink/lib；jar 不入库，见 §9 重建）
-├── flink-sql/               # job1（ODS→DWD 四分支）/ job2（DWD→DWS）×2 / job3（DWS→ADS 无状态 sink）
+├── flink-sql/               # job1（ODS→DWD 四分支）/ job2（DWD→DWS）×2 / job4（维度 lookup）/ job3（sink）
 ├── scripts/fetch_flink_lib.sh  # 重建 flink-lib（镜像提取 13 + Maven 下载 4，幂等）
 ├── scripts/submit_sql.sh    # 作业提交脚本（独立容器 + remote target）
-├── scripts/start_env.sh     # 环境一键启动（compose up + 健康/topic/作业检查，幂等）
+├── scripts/start_env.sh     # 环境一键启动（体检/收敛/作业补齐；--full = 冷启动恢复链）
+├── scripts/replay_traffic.sh          # 流量源确定性重放 2000 行（幂等，带保留期断言）
+├── scripts/load_mysql_source.sh       # MySQL 源库初始化/重灌（空库自动灌，非空拒绝，--force 覆盖）
 ├── scripts/replay_dwd_payment_sorted.sh  # 交易支付按时间序重放（节点8，幂等）
 ├── data-generator/          # 行为日志生成器 V2 / 业务生成器 V2 + manifest
 ├── mysql/                   # business DDL、init、ads 结果库 DDL

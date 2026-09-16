@@ -47,7 +47,20 @@ services:
     ports:
       - "3306:3306"
     volumes:
-      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+      # 首次初始化脚本（2026-09-16 修复）。原来挂的是 `./mysql-init` —— 那是个**空目录**
+      # （且空目录不入 git，全新 clone 根本没有它）→ 空 mysql-data 卷首次启动时
+      # entrypoint 无脚本可跑 → 建出**空库**：gmall_rt 里一张表都没有，下游 CDC 无表可读、
+      # 全链路静默无输出（与"空 topic"同一类故障：不报错，只是所有指标为空）。
+      # 注意 mysql 官方镜像**只在数据目录为空时**执行 initdb.d —— 已有数据的卷不会被重跑，
+      # 所以这里补齐挂载对现有环境**无影响**，只影响将来的全新环境。
+      # 顺序由文件名数字前缀决定（entrypoint 按字典序执行），依赖关系：
+      #   01 建业务表 → 02 灌维度种子 → 03 灌交易数据(依赖 01) → 04 建实时结果表
+      - ./mysql/business_ddl.sql:/docker-entrypoint-initdb.d/01_business_ddl.sql:ro
+      - ./mysql/init_data.sql:/docker-entrypoint-initdb.d/02_init_data.sql:ro
+      - ./data-generator/data/generated/business_data_20260901.sql:/docker-entrypoint-initdb.d/03_business_data_20260901.sql:ro
+      - ./mysql/ads_result_rt_ddl.sql:/docker-entrypoint-initdb.d/04_ads_result_rt_ddl.sql:ro
+      # 刻意不挂 mysql/ads_result_ddl.sql：它是离线项目遗留件，内部自相矛盾
+      # （先 CREATE DATABASE gmall_report，再 USE gmall_report_rt），挂了会让初始化中断
       - mysql-data:/var/lib/mysql        # 数据持久化：Docker 重启不丢数（2026-08-24 两次丢失教训）
     restart: unless-stopped              # 环境可靠性：Docker Desktop 退出后自动恢复
     healthcheck:
@@ -73,6 +86,19 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # ⚠️ 这里**故意没有**设 KAFKA_LOG_RETENTION_HOURS: "-1"，虽然它本该设。
+      # 原因：保留期默认 168 小时，而本项目记录的 Kafka 时间戳 = 重放那一刻
+      # （业务时间 2026-09-01 只存在消息体里）→ 这套"固定历史测试日"的数据集
+      # 写入满 7 天就会被 retention cleaner 静默删掉：topic 还在、作业全 RUNNING、
+      # 指标还是旧值，只是源数据没了（实测 ods_traffic_log 被删空，log start offset
+      # 从 0 跳到 2000；同期其余 topic 距同一失效点只剩 79 分钟）。
+      # 但**加这个 env 会触发 Kafka 容器重建**（实测 --dry-run），
+      # 而下面 kafka-data 卷挂错路径 → 重建 = 静默清空全部 topic。
+      # 所以保留期改由**不需要重建**的两层兜住（都已生效）：
+      #   ① 运行中集群: broker 动态配置 log.retention.ms=-1 + 各 topic retention.ms=-1
+      #   ② 脚本层: scripts/start_env.sh 每次启动幂等收敛一遍 topic 级 retention.ms=-1；
+      #     两个重放脚本创建 topic 时也显式带 --config retention.ms=-1
+      # 待卷修复完成、需要重建 Kafka 时，再把 KAFKA_LOG_RETENTION_HOURS: "-1" 加回来。
     ports:
       - "29092:29092"
     volumes:
