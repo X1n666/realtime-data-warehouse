@@ -1,0 +1,20 @@
+# 换行符策略（2026-09-16）
+#
+# 为什么需要这个文件：本机 core.autocrlf=true，仓库里存的虽然是 LF，但**检出到
+# Windows 工作区时会被转成 CRLF**。对 shell 脚本来说这是致命的——bash 读到行尾的
+# \r 会当场报 `$'\r': command not found`，`scripts/start_env.sh` 第一行就挂，
+# "clone → 一键重建环境"这条路径直接失效（README §9 的 --full 恢复链就是这么用的）。
+# 症状还很有迷惑性：`bash -n` 语法检查能过（它不执行），只有真跑才炸。
+#
+# eol=lf 同时**关掉**了该路径的自动转换，也让仓库内容与工作区保持一致：
+# Linux/WSL 上克隆同样能直接执行。
+*.sh   text eol=lf
+
+# SQL / YAML 同样按 LF 存：它们会被 Flink SQL 客户端与 docker compose 读取，
+# LF 是这两个生态的原生格式，没有理由让工作区里多一层转换。
+*.sql  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# 生成器输出的数据文件会被 MySQL 的 LOAD/INSERT 解析，固定 LF 避免平台差异。
+*.txt  text eol=lf
