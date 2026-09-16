@@ -11,6 +11,14 @@ SET 'pipeline.name' = 'job1_ods_to_dwd';
 SET 'parallelism.default' = '1';
 SET 'execution.checkpointing.interval' = '30s';
 SET 'state.checkpoints.num-retained' = '3';
+-- 去重状态 TTL：必须显式设置。开源 Flink 的 table.exec.state.ttl 默认值 = 0
+--   （字节码实证：ConfigOption.defaultValue(Duration.ofMillis(0))，描述原文
+--   "Default value is 0, which means that it will never clean up state."）
+--   → 不设 = 每个出现过的 event_id 永久占一条状态 → 状态随基数线性增长、
+--     checkpoint 越来越大、恢复越来越慢。取值依据 = 业务去重窗口
+--     （event_id 不会在 24h 后才重复到达），远小于数据时间跨度才是安全的。
+--   注意：阿里云 VVR ≥4.0.12 默认 1.5 天，与开源版不同，面试别答混。
+SET 'table.exec.state.ttl' = '24h';
 
 CREATE TABLE ods_traffic_log (
   common ROW<uid BIGINT, platform STRING, province_id BIGINT, ts STRING>,

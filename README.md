@@ -2,7 +2,7 @@
 
 > 一句话定位：用 **Flink + Kafka + Flink CDC** 在单机 WSL2 环境里搭建"物理四层"的电商实时数仓，覆盖**行为日志**与**交易数据**两大域，产出 PV/UV/GMV/支付/退款等指标，支持批流对账与 Grafana 可视化。
 >
-> 设计总纲：《实时数仓项目设计方案V2.md》（项目根目录），本项目 README 是其运行态快照。学习资料（Flink 复习笔记、SQL 错题手册、面试手册）见 [docs/](docs/)。**每一步的做了什么/为什么/怎么验证/出错如何重跑**，见 [docs/开发日志.md](docs/开发日志.md)（节点式日志）。
+> 设计总纲：《实时数仓项目设计方案V2.md》（项目根目录），本项目 README 是其运行态快照。学习资料（Flink 复习笔记、SQL 错题手册、面试手册、[面试速览卡](docs/面试速览卡.md)）见 [docs/](docs/)。**每一步的做了什么/为什么/怎么验证/出错如何重跑**，见 [docs/开发日志.md](docs/开发日志.md)（节点式日志）。
 
 ---
 
@@ -144,6 +144,31 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 
 - 生成器确定性 → 同 seed 重放产出相同事件 → 批基准可复现（交易：MySQL 批 SQL + manifest；流量：生成器重放统计）。
 - 全链路 upsert 幂等：DWD/DWS 用 upsert-kafka（主键覆盖），ADS 用 MySQL `ON DUPLICATE KEY UPDATE`。作业 cancel 后重提交 = 无状态全量重算 + 覆盖写 = 不产生重复指标。
+
+### 4.5 状态管理与容错
+
+**Checkpoint**（4 个作业统一）：`execution.checkpointing.interval = 30s`、`state.checkpoints.num-retained = 3`。
+
+**状态盘点——哪些有界、哪些无界**（这是"要不要配 TTL"的判断依据）：
+
+| 作业  | 有状态算子                       | 状态规模                             | TTL                    |
+| ----- | -------------------------------- | ------------------------------------ | ---------------------- |
+| job1  | 流量 `event_id` 去重（ROW_NUMBER）| **∝ 累计去重键数 → 无界增长**        | **24h（显式设置）**    |
+| job1  | 3 条 CDC 支线                    | 无（透传，唯一性由 MySQL 主键保证）  | —                      |
+| job2  | 窗口聚合 + `COUNT(DISTINCT)`     | ∝ 窗口数，窗口 fire 后自动清理       | 不设                   |
+| job2  | 日聚合（非窗口 `GROUP BY`）      | ∝ group key 基数（日期 × 指标），有界 | 不设（见下）           |
+| job3  | 无状态 sink                      | —                                    | —                      |
+
+两个必须讲清的结论：
+
+1. **开源 Flink 的 `table.exec.state.ttl` 默认值是 `0` = 永不过期**（字节码实证：`ConfigOption.defaultValue(Duration.ofMillis(0))`，官方描述原文 "Default value is 0, which means that it will never clean up state"）。阿里云 VVR ≥ 4.0.12 的默认值则是 1.5 天——**两者不同，别答混**。不显式设置时，job1 的去重状态随累计去重键数线性增长，直接推高 checkpoint 体积与恢复耗时。
+2. **日聚合刻意不设 TTL**：它的状态按 key 基数有界（规模很小），但 `COUNT(DISTINCT uid)` 会保留去重集合；若 TTL 过短，迟到数据到达时状态已被清理，聚合会从零重算写出**错的**日指标（可能报 `Can not retract a non-existent record`）。**TTL 不是越短越好——取值必须小于业务可接受的重算窗口。**
+
+**端到端一致性的准确边界**（面试高频，答"精确一次"会露馅）：
+
+- Kafka 侧：开 checkpoint 后 kafka sink 走两阶段提交，链路内 **exactly-once**；
+- MySQL 侧：JDBC sink 用 `ON DUPLICATE KEY UPDATE` 幂等写 → 整体是 **at-least-once 投递 + 幂等落库**；
+- 因为最终形态是**按主键覆盖**，重复消费不产生重复指标——**用幂等性换取了不引入 2PC 的复杂度**。这也是故障恢复时敢用"全量重算 + 覆盖写"的依据。
 
 ---
 
