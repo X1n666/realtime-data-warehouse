@@ -170,6 +170,23 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 - MySQL 侧：JDBC sink 用 `ON DUPLICATE KEY UPDATE` 幂等写 → 整体是 **at-least-once 投递 + 幂等落库**；
 - 因为最终形态是**按主键覆盖**，重复消费不产生重复指标——**用幂等性换取了不引入 2PC 的复杂度**。这也是故障恢复时敢用"全量重算 + 覆盖写"的依据。
 
+**状态后端与 checkpoint 落在哪儿**（本项目的一个**真实局限**，主动说出来比被问出来好）：
+
+| 项                        | 实际值                        | 证据                                                        |
+| ------------------------- | ----------------------------- | ----------------------------------------------------------- |
+| `state.backend`           | `HashMapStateBackend`         | `GET /jobs/<jid>/checkpoints/config`（运行中作业的运行时真值） |
+| `state.checkpoint-storage`| `JobManagerCheckpointStorage` | 同上                                                        |
+| `state.checkpoints.dir`   | **未配置**                    | `/jobmanager/config` 有效配置里无该键；仓库内 grep 无结果    |
+| checkpoint 外部化         | `externalization.enabled=false` | 同上                                                      |
+
+含义——checkpoint 的元数据与状态字节**全部存在 JobManager 的堆内存里**，而 jobmanager 容器**没有挂任何持久化卷**（compose 里只挂了 `./flink-lib`）：
+
+- **JM 容器丢失 = 所有 checkpoint 一起丢失**，无从 restore，只能无状态全量重算。本项目靠 upsert + `ON DUPLICATE KEY UPDATE` 幂等，重算结果与基线**逐值一致**（已实测，见开发日志）。
+- 单机 standalone 集群**没有 HA**：JM 重启后作业不会自动拉起，需按依赖序重新提交。
+- `JobManagerCheckpointStorage` 还有个**硬上限**：它用 `MemCheckpointStreamFactory` 写状态，而 `checkSize()` 在超过 `DEFAULT_MAX_STATE_SIZE = 5242880`（5 MB）时**直接抛 IOException 让 checkpoint 失败**，不是告警（字节码实证，异常文案：`Size of the state is larger than the maximum permitted memory-backed state.`）。当前实际体积远低于该值（四类作业最大约 0.6 MB / 耗时 3–12 ms），但**去重状态一旦增长（如把 TTL 调大）就会撞上这个悬崖**。
+
+**修复方向（尚未实施）**：显式设 `state.checkpoints.dir: file:///opt/flink/checkpoints`（存储随之切到 `FileSystemCheckpointStorage`），并在 jobmanager / taskmanager 上挂**同一个命名卷、同一路径**（`file://` 路径须两容器都可达）。配套可开 checkpoint 外部化，便于 cancel 后仍能恢复。**代价：需重建容器，会终止当前 12 个作业。**
+
 ---
 
 ## 5. 环境与数据清单
