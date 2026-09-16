@@ -13,7 +13,7 @@
 **为什么做这个项目**（秋招导向）：
 
 - 覆盖大数据开发岗位的核心面试点：分层建模、事件时间与 watermark、窗口、状态与去重、checkpoint、CDC/changelog、Upsert 幂等、批流对账、故障恢复。
-- 简历亮点（当前状态即可这样写）：**物理四层实时数仓**（Job1 接入 ×4 / Job2 DWS ×4 / Job3 无状态 sink ×4，**12 作业**全 RUNNING）、Flink CDC 交易链路（下单/支付/退款三阶段生命周期）、**日口径 9 项指标流批逐值对账分毫不差 + 分钟级 UV/GMV 逐值对账**、环境一键启动复现。
+- 简历亮点（当前状态即可这样写）：**物理四层实时数仓**（Job1 接入 ×4 / Job2 DWS ×4 / Job4 维度建模 ×2 / Job3 无状态 sink ×4，**14 作业**全 RUNNING）、Flink CDC 交易链路（下单/支付/退款三阶段生命周期）、**Lookup Join 维度建模（分省 GMV / 分品类金额，求和回日锚点 = 顺带证明 join 基数正确）**、**日口径 11 项指标流批逐值对账分毫不差 + 分钟级 UV/GMV 逐值对账**、环境一键启动复现。
 
 ---
 
@@ -60,7 +60,7 @@
 
 **分层语义**：ODS（原样接入）→ DWD（明细清洗、去重、规范化）→ DWS（按指标聚合的中间结果）→ ADS（面向展示的结果表）。
 
-**物理四层已于 2026-09-03 达成**（开发日志 节点 6+8+10）：**12 作业三层拓扑**（Job1×4 / Job2×4 / Job3×4）全部 RUNNING。拆作业的关键收益：**指标只在 Job2 算一次**（拆前 ads 分支从 DWD 明细重复计算 = 每指标双份窗口/去重状态），Job3 读 DWS 聚合后的"当前绝对值" + 同主键覆盖写 MySQL → **无状态作业**（无窗口/去重/累计算子，重启秒级、重放天然幂等）。节点 8 后分钟指标补齐（分钟 UV / 交易分钟 GMV、订单数），分钟层共 4 指标 × 分钟窗口驱动趋势曲线；节点 10 交易域扩到下单侧（订单明细 CDC → 下单金额/单数/明细行数，与支付 GMV 对照 = 下单→支付转化视角），日指标 6 → 9。
+**物理四层已于 2026-09-03 达成**（开发日志 节点 6+8+10）：**12 作业三层拓扑**（Job1×4 / Job2×4 / Job3×4）全部 RUNNING。**2026-09-16 补第 5 层「维度建模」**（Job4×2，Lookup Join 补 `province_id`/`category_id` 两跳维度）→ **14 作业**全 RUNNING。拆作业的关键收益：**指标只在 Job2 算一次**（拆前 ads 分支从 DWD 明细重复计算 = 每指标双份窗口/去重状态），Job3 读 DWS 聚合后的"当前绝对值" + 同主键覆盖写 MySQL → **无状态作业**（无窗口/去重/累计算子，重启秒级、重放天然幂等）。节点 8 后分钟指标补齐（分钟 UV / 交易分钟 GMV、订单数），分钟层共 4 指标 × 分钟窗口驱动趋势曲线；节点 10 交易域扩到下单侧（订单明细 CDC → 下单金额/单数/明细行数，与支付 GMV 对照 = 下单→支付转化视角），日指标 6 → 9。
 
 ---
 
@@ -74,7 +74,7 @@
 | Kafka          | 3.7.1（KRaft 单节点）                  | ODS/DWD/DWS 之间解耦的消息通道；KRaft 省掉 Zookeeper；官方镜像 3.7 起发布                                                                                         |
 | Upsert Kafka   | —                                      | 承接 changelog 流（+I/-D/-U/+U）：DWD 去重、DWS 聚合结果都含 update/delete 语义，append-only sink 会直接报错（Day4 实测踩坑）                                     |
 | JDBC sink      | flink-connector-jdbc 3.2.0-1.19        | 幂等写 MySQL：`INSERT ... ON DUPLICATE KEY UPDATE` 覆盖式 upsert，可重放不累加                                                                                  |
-| Docker Compose | WSL2 单机                              | 一键起全环境；`name:` 字段固定项目名（目录为中文名时防网络名漂移）；named volume 持久化 mysql/kafka 数据                                               |
+| Docker Compose | WSL2 单机                              | 一键起全环境；`name:` 字段固定项目名（目录为中文名时防网络名漂移）；named volume 持久化 mysql/kafka 数据（**⚠️ Kafka 那条实测无效，卷挂错路径，见 §5.1**）                                               |
 | Grafana        | 11.1.0                                 | 指标可视化；provisioning 配置化管理（数据源/看板随 compose 注册，可复现）                                                                                          |
 
 **明确不引入**（防止范围膨胀）：Doris / ClickHouse / Paimon（OLAP 或湖格式，单机资源与学习阶段不必要）、Canal/MaxWell（额外服务）、HBase/Redis（维表缓存暂用 Flink 状态）。
@@ -120,7 +120,7 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 
 **退款时间分布**：退款 create_time 滞后支付 1-2 天（9/1 支付，退款落在 9/1-9/3）——生成器模拟真实业务，退款按"退款时间"归日聚合（开发日志 节点 3）。
 
-### 4.3 指标口径锚点（支付/流量 6 项 + 下单 3 项 = 9 项，禁止漂移）
+### 4.3 指标口径锚点（支付/流量 6 项 + 下单 3 项 + 维度 2 项 = 11 项，禁止漂移）
 
 | # | 指标         | 口径                                             | 对账方式                    |
 | - | ------------ | ------------------------------------------------ | --------------------------- |
@@ -133,6 +133,10 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | 7 | 下单金额     | SUM(order_price×sku_num)，按下单时间（节点10 新增，来源 dwd_order_detail）| 批 SQL：SUM               |
 | 8 | 下单订单数   | DISTINCT order_id（订单明细表）                  | 批 SQL：COUNT(DISTINCT)     |
 | 9 | 下单明细行数 | COUNT(*)（订单明细行）                           | 批 SQL：COUNT(*)            |
+| 10 | 分省支付 GMV | 指标 4 按 `base_province.name` 拆维（节点11，Lookup Join 补 `order_info.province_id`）| 批 SQL 分组后 **求和必须回到指标 4** |
+| 11 | 分品类下单金额 | 指标 7 按 `base_category.name` 拆维（节点11，链式 Lookup Join 补 `sku_info→category_id`）| 批 SQL 分组后 **求和必须回到指标 7** |
+
+**维度指标的完整性红线**：`SUM(分省 GMV)` 必须等于日锚点 `gmv`、`SUM(分品类下单金额)` 必须等于 `order_gmv`。这等价于**证明 join 基数正确**——维表未命中会丢行（和偏小）、维表一对多会行膨胀（和偏大）。**加维度不改口径**，所以这条校验是维度建模的验收标准，不是巧合。
 
 **红线**：禁止 `SUM(分钟UV)` 当日 UV、`SUM(分钟支付用户数)` 当日支付用户数、browse+click 混合当 PV。分钟指标与日指标天然不可加（同一用户可跨多个分钟窗口活跃），差异要在对账中写清楚，而不是消除。
 
@@ -170,22 +174,23 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 - MySQL 侧：JDBC sink 用 `ON DUPLICATE KEY UPDATE` 幂等写 → 整体是 **at-least-once 投递 + 幂等落库**；
 - 因为最终形态是**按主键覆盖**，重复消费不产生重复指标——**用幂等性换取了不引入 2PC 的复杂度**。这也是故障恢复时敢用"全量重算 + 覆盖写"的依据。
 
-**状态后端与 checkpoint 落在哪儿**（本项目的一个**真实局限**，主动说出来比被问出来好）：
+**状态后端与 checkpoint 落在哪儿**（运行时真值，`GET /jobs/<jid>/checkpoints/config`）：
 
-| 项                        | 实际值                        | 证据                                                        |
-| ------------------------- | ----------------------------- | ----------------------------------------------------------- |
-| `state.backend`           | `HashMapStateBackend`         | `GET /jobs/<jid>/checkpoints/config`（运行中作业的运行时真值） |
-| `state.checkpoint-storage`| `JobManagerCheckpointStorage` | 同上                                                        |
-| `state.checkpoints.dir`   | **未配置**                    | `/jobmanager/config` 有效配置里无该键；仓库内 grep 无结果    |
-| checkpoint 外部化         | `externalization.enabled=false` | 同上                                                      |
+| 项                        | 实际值                              | 说明                                                        |
+| ------------------------- | ----------------------------------- | ----------------------------------------------------------- |
+| `state.backend`           | `HashMapStateBackend`               | 状态在 TM 堆（小状态够用，不需要 RocksDB）                   |
+| `state.checkpoint-storage`| **`FileSystemCheckpointStorage`**   | **2026-09-16 修复后**：由 `state.checkpoints.dir` 自动切换   |
+| `state.checkpoints.dir`   | `file:///opt/flink/checkpoints`     | JM/TM 挂**同一命名卷 `flink-checkpoints`、同一路径**          |
+| checkpoint 外部化         | `externalization.enabled=false`     | cancel 后不保留（后续可开）                                   |
 
-含义——checkpoint 的元数据与状态字节**全部存在 JobManager 的堆内存里**，而 jobmanager 容器**没有挂任何持久化卷**（compose 里只挂了 `./flink-lib`）：
+**修复前是一个真实局限，而"怎么发现并修掉它"比结论值钱**（主动讲这段比被问出来好）：
 
-- **JM 容器丢失 = 所有 checkpoint 一起丢失**，无从 restore，只能无状态全量重算。本项目靠 upsert + `ON DUPLICATE KEY UPDATE` 幂等，重算结果与基线**逐值一致**（已实测，见开发日志）。
-- 单机 standalone 集群**没有 HA**：JM 重启后作业不会自动拉起，需按依赖序重新提交。
-- `JobManagerCheckpointStorage` 还有个**硬上限**：它用 `MemCheckpointStreamFactory` 写状态，而 `checkSize()` 在超过 `DEFAULT_MAX_STATE_SIZE = 5242880`（5 MB）时**直接抛 IOException 让 checkpoint 失败**，不是告警（字节码实证，异常文案：`Size of the state is larger than the maximum permitted memory-backed state.`）。当前实际体积远低于该值（四类作业最大约 0.6 MB / 耗时 3–12 ms），但**去重状态一旦增长（如把 TTL 调大）就会撞上这个悬崖**。
-
-**修复方向（尚未实施）**：显式设 `state.checkpoints.dir: file:///opt/flink/checkpoints`（存储随之切到 `FileSystemCheckpointStorage`），并在 jobmanager / taskmanager 上挂**同一个命名卷、同一路径**（`file://` 路径须两容器都可达）。配套可开 checkpoint 外部化，便于 cancel 后仍能恢复。**代价：需重建容器，会终止当前 12 个作业。**
+- 修复前 `state.checkpoint-storage = JobManagerCheckpointStorage`、`state.checkpoints.dir` 未配置、jobmanager **没挂任何持久化卷** → checkpoint 的元数据与状态字节**全在 JM 堆内存里**，**JM 一丢全丢、无从 restore**；单机 standalone 又**没有 HA**（JM 重启后作业不会自动拉起，需按依赖序重提）。
+- **再深一层（很少有人知道）**：`JobManagerCheckpointStorage` 用 `MemCheckpointStreamFactory` 写状态，`checkSize()` 超过 `DEFAULT_MAX_STATE_SIZE = 5242880`（5 MB）会**直接抛 IOException 让 checkpoint 失败**，不是告警（字节码实证，异常文案 `Size of the state is larger than the maximum permitted memory-backed state.`）。当前体积最大约 0.6 MB / 耗时 3–12 ms 很安全，但**去重状态一旦增长（如把 TTL 调大）就会撞上这个悬崖**。
+- **修法**：设 `state.checkpoints.dir`（存储自动切 `FileSystemCheckpointStorage`）+ 两容器挂同一命名卷同路径。**踩到的 Docker 坑**：Docker 给"镜像里不存在的路径"建挂载点时属主是 `root:root/755`，而 flink 镜像的 `/docker-entrypoint.sh` 会把 PID 1 降权到 `flink` 用户 → JM 建 checkpoint 目录 EACCES，作业直接 `JobInitializationException: Failed to create directory for shared state`。
+  **假阳性陷阱**：`docker exec` 进去手测 `mkdir` 会成功（exec 默认 root，绕过 entrypoint），很容易误判"权限没问题"——**必须用 `ps` 看 PID 1 的真实用户**。修法是加一次性 init 容器 `chown -R flink:flink`，且**必须覆盖 entrypoint**（否则 chown 也以 flink 身份跑 → `Operation not permitted`）。
+- **验证方式（不只看配置）**：`/jobs/<jid>/checkpoints/config` 显示 `FileSystemCheckpointStorage`，且卷内真有 `chk-N/_metadata` 文件。
+- **但要说清边界**：存储位置修好 ≠ 恢复演练做过。当前恢复手段仍是**无状态全量重算 + 幂等覆盖写**（已实测），**从 checkpoint restore 的完整链路尚未演练**。
 
 ---
 
@@ -197,11 +202,15 @@ binlog 实测事件形态（ROW 格式下每行一个事件）：
 | ----------------- | ---------------------- | ------------------------ | ------------- |
 | gmall_mysql       | mysql:8.0              | 1G                       | 3306          |
 | gmall_kafka       | apache/kafka:3.7.1     | 1.5G                     | 29092（主机） |
+| gmall_flink_ckpt_init | flink:1.19.1       | 一次性 init（chown checkpoint 卷） | —        |
 | gmall_jobmanager  | flink:1.19.1           | 768M                     | 8081          |
-| gmall_taskmanager | flink:1.19.1           | 2.5G，**12 slots** | —            |
+| gmall_taskmanager | flink:1.19.1           | 2.5G，**14 slots**（= 作业总数） | —     |
 | gmall_grafana     | grafana/grafana:11.1.0 | 512M                     | 3000          |
 
-- 全部容器 `restart: unless-stopped`；mysql/kafka 数据挂 **named volume**（Docker 意外退出不丢数据，2026-08-24 两次丢失教训）。
+- 全部容器 `restart: unless-stopped`（init 容器是一次性的 `restart: "no"`，JM/TM 用 `depends_on: service_completed_successfully` 等它跑完）。
+- **`flink-checkpoints` 命名卷**（2026-09-16）：JM/TM 同卷同路径 `/opt/flink/checkpoints`，checkpoint 落盘。因 Docker 给新挂载点的属主是 `root:root` 而 flink 镜像 PID 1 降权到 `flink`，需 init 容器先 `chown`（详见 §4.5）。
+- ⚠️ **`kafka-data` 卷目前是无效的（已知缺陷，待修）**：Kafka 实际写 `/tmp/kafka-logs`（实测 14 MB 真实数据），而卷挂在 `/tmp/kraft-combined-logs`（4 KB 空目录）→ **持久化没生效，所有 topic 数据在容器可写层**，任何 `recreate`/`down` 会静默清空。自检命令：`docker exec gmall_kafka du -sh /tmp/kafka-logs /tmp/kraft-combined-logs`。修复需重建 Kafka 容器（先迁移数据），**尚未实施**——排查过程见 [开发日志](docs/开发日志.md)。
+- mysql 数据挂 named volume（Docker 意外退出不丢数据，2026-08-24 两次丢失教训）——**这一条对 MySQL 成立，对 Kafka 不成立**（见上条）。
 - `name: ecommerce-realtime-data-warehouse` 固定 compose 项目名（目录为中文名，防默认项目名漂移导致网络名变化）。
 - flink-lib/ 挂载 connector jars（17 个 = 13 个 Flink 发行版自带 + 4 个外挂：mysql-cdc / kafka / jdbc / mysql-connector-j）。**jar 为二进制依赖不入库**（合计 ~230MB，其中 flink-dist 单文件 121MB 超 GitHub 100MB 硬限制）——clone 后由 [scripts/fetch_flink_lib.sh](scripts/fetch_flink_lib.sh) 幂等重建：13 个从 `flink:1.19.1` 镜像 `docker cp` 提取（版本与镜像锁定），4 个从 Maven Central 下载；`start_env.sh` 检测到缺失会自动调用。
 
@@ -225,7 +234,7 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 ### 5.3 MySQL
 
 - **gmall_rt**（CDC 源库，9 表）：user_info / base_province / base_category / spu_info / sku_info / order_info / order_detail / payment_info / order_refund_info。binlog ROW + FULL + expire 30 天。
-- **gmall_report_rt**（结果库，DDL 见 [mysql/ads_result_rt_ddl.sql](mysql/ads_result_rt_ddl.sql)，实际写入 4 表，均由 Job3 覆盖写）：ads_traffic_1m（33 窗口）/ ads_traffic_day / ads_trade_day（9 行 = 9/1 七指标 + 9/2、9/3 退款）/ ads_trade_1m（162 窗口）。**此库为独立 database**（非 gmall_rt 源库）——建表脚本在 MySQL 空卷初始化后执行过，容器重建/卷丢失后需重跑该 DDL 再启 Job3。
+- **gmall_report_rt**（结果库，DDL 见 [mysql/ads_result_rt_ddl.sql](mysql/ads_result_rt_ddl.sql)，实际写入 4 表，均由 Job3 覆盖写）：ads_traffic_1m（33 窗口）/ ads_traffic_day / ads_trade_day（30 行 = 9/1 的 28 行〔7 个日指标 + 分省 12 + 分品类 9〕+ 9/2、9/3 退款 2 行）/ ads_trade_1m（162 窗口）。**此库为独立 database**（非 gmall_rt 源库）——建表脚本在 MySQL 空卷初始化后执行过，容器重建/卷丢失后需重跑该 DDL 再启 Job3。
 
 ### 5.4 测试日数据（2026-09-01）
 
@@ -254,6 +263,7 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 | 节点8 | **分钟指标补齐**：流量分钟 UV + 交易分钟表 + 一键启动脚本                                                | 分钟 UV 33 窗口 627≤PV 636 ✓；交易分钟 **162 窗口** GMV 1,119,295.10 = 日 1,136,485.35 − 尾部单笔 17,190.25 ✓；抽 3 分钟窗口 vs MySQL 明细逐值相等 ✓（11 作业 RUNNING） |
 | 节点9 | **看板分钟层补齐**：9 面板（PV/UV 双系列 + 分钟 GMV 曲线）                                                | API 验证：9 面板注册 ✓；GMV 序列 162 行 / UV 33 行取数 ✓（浏览器 localhost:3000 admin/admin）                                          |
 | 节点10 | **下单侧链路（加分）**：Job1 加订单明细 CDC 分支（server-id 5420-5424）→ dwd_order_detail；Job2 交易日聚合 +3 指标（下单金额/单数/明细行数）；start_env.sh 支持 Job1×4 | **7/7 流=批 ✓**（下单金额 1,334,596.00 / 200 单 / 398 明细行；旧 4 指标 1,136,485.35/182/83/退款按日不变；分钟层 162/33 窗口完好）12 作业 RUNNING（Job1×4/Job2×4/Job3×4） |
+| 节点11 | **维度建模（Lookup Join）**：Job4×2 用链式 lookup 补维度（`payment→order_info→base_province`、`order_detail→sku_info→base_category`）→ 分省 GMV / 分品类下单金额；slot 12→14 | **11/11 流=批 ✓**（`gmv_province` 12 省合计 1,136,485.35、`order_amount_category` 9 品类合计 1,334,596.00 = **维度求和回日锚点**，同时证明 join 基数不丢不重）。两条约束 EXPLAIN 实证：`FOR SYSTEM_TIME AS OF` 只能引用左表时间属性；JDBC 维表**不是版本表** → 事件时间 temporal join 用不了，只能 `PROCTIME()`。踩到「空 topic 静默空读」（见下方难点 12） |
 
 **过程中修掉的关键问题**（面试可讲，均记录在开发日志）：
 
@@ -268,6 +278,9 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 9. **共享 consumer group 第二次踩**（节点8）：给既有文件的日 INSERT 旁加分钟 INSERT 时，直接复用了原 source DDL → 两个独立作业同 group → rebalance 中断分钟消费。教训：**同一文件每新增一个 INSERT 分支，其 source 必须再立一份 DDL + 独立 group.id**（job2_dwd 的日段 source 早独立，trade 加段时漏了）
 10. **事件时间乱序 → 水位跳变丢窗口**（节点8，最值钱）：CDC snapshot 按主键扫描输出，而测试数据 id 流水号与支付时间错位 → topic 内时间非单调 → 窗口只 fire 43 个（中午前）就停。分层排查法：非窗口日聚合对账正确 → 临时无窗口小时统计全量 ✓ → dump topic 时间序列见乱序 → 机制 = upsert-kafka 水位按物理消费序推进，先读到晚事件则其后早事件全被判"迟到"丢弃。修复 = 一次性按时间序重放成"真实事件流"（replay 工具，与流量 generator replay 同哲学）
 11. **误双提 + 异步 cancel 竞赛 → 作业风暴**（节点10）：提交命令笔误执行两次 → 同 server-id 的 CDC 作业互相踢下线 → 15 个 RUNNING/RESTARTING 循环，cancel 与 restart 赛跑清不掉 → 正确恢复 = **重启 jobmanager**（standalone 无 HA，作业全灭，数据在 Kafka/MySQL 不丢）→ 按依赖序一键重提 12 作业。教训：CDC 多作业必须分段 server-id，恢复用"全灭重建"而不是逐 job cancel；另修复 start_env.sh CRLF 坑（Windows docker.exe 管道输出 CRLF 化 → URL 混入 \r，curl exit 3）
+12. **空 topic 静默空读**（节点11，**最难查**）：job4 省份分支零输出，作业却 `RUNNING`、无异常、指标为 0。三次假设被证据依次推翻（默认 startup mode → `auto.offset.reset` 实为 earliest → topic 本身就是空的 `earliest=latest=182`），真因在 **broker 日志**：① `auto.create.topics.enable=true` + **订阅它的消费者在线** → 任何 metadata 请求都会把刚删掉的 topic **自动重建为空 topic**；② topic 删除是**异步**的，实测耗时 **整 60 秒**；③ committed offset 落在新 topic 合法区间内（正好 = 末尾）→ 不回退。**复现实验钉死归因**：消费者在线时删除永远完不成（60s 一轮循环），cancel 掉订阅它的 4 个作业后**删除 1 秒完成**。
+    **连带挖出更严重的隐患**：`du -sh` 对比发现 Kafka 实际写 `/tmp/kafka-logs`（14 MB 真实数据），而 `kafka-data` 卷挂在 `/tmp/kraft-combined-logs`（4 KB 空目录）→ **持久化根本没生效，所有 topic 数据在容器可写层**，任何 `recreate`/`down` 会静默清空（auto-create 会把"数据没了"伪装成"topic 正常"）。
+    **两条方法学教训**：① 别用聚合指标代替日志——曾据 source 顶点 `write-records=0` 误判"CDC 没读"，而 TM 日志写着 `Finished exporting 182 records for split 'gmall_rt.payment_info:0'`；② **锚点一致 ≠ 这次算出来的**——`dws_trade_day` 是 upsert topic，旧值一直躺在 Kafka 里，链路没重算时 job3 会把旧值原样转发进 MySQL、锚点照样全对。核验重算要看**过程证据**（消费组位点 / source 读入量），更严的做法是先清空下游 topic 再重算（clean-room）。已把「空 topic 哨兵」写进 `start_env.sh` 第 4.5 步。
 
 ---
 
@@ -277,7 +290,7 @@ Job2 交易域支付/分钟窗口消费 `dwd_payment_detail_sorted`——原因�
 
 | # | 项目经验（§6 关键问题 / 开发日志节点） | Flink 学习与思考题复习笔记 | SQL 错题复习手册 | 数据开发实习面试复习手册 |
 | - | ------------------------------------- | -------------------------- | ---------------- | ------------------------ |
-| 1 | 物理四层 ODS/DWD/DWS/ADS + 12 作业、Job3 无状态化动机（节点6） | 第一讲 流处理全景（分层与流批对比） | — | 第一章 P0 1.1-1.2 数仓分层/表粒度 |
+| 1 | 物理四层 ODS/DWD/DWS/ADS + 14 作业、Job3 无状态化动机（节点6） | 第一讲 流处理全景（分层与流批对比） | — | 第一章 P0 1.1-1.2 数仓分层/表粒度 |
 | 2 | 锚点红线：分钟 UV/用户数不可 SUM 当日（节点4/5） | 第三讲 窗口（窗口与聚合粒度） | 一、聚合粒度与窗口函数 | 4.2 为什么 UV 不能把每天结果相加 |
 | 3 | order_gmv 1,334,596.00 vs gmv 1,136,485.35 = 下单→支付漏斗（节点10） | — | 一、聚合粒度（多表多粒度计数） | 5.3 漏斗转化率 / 5.1 PV 与 UV |
 | 4 | 支付流水 PK id 非 order_id；明细 vs 订单粒度（节点1） | 第一讲（粒度/主键语义） | 二、多表连接与数据膨胀 | 3.1 事务事实表 / 1.2 粒度 |
@@ -313,7 +326,7 @@ bash scripts/start_env.sh           # 幂等可重跑；环境重建后加 --ful
 
 # 3) 打开面板
 #    看板   http://localhost:3000   （admin / admin，本地测试凭据）
-#     Flink  http://localhost:8081   （12 作业应全 RUNNING）
+#     Flink  http://localhost:8081   （14 作业应全 RUNNING）
 ```
 
 前提：Docker Desktop + WSL2（内存建议 ≥8GB）、bash（Git Bash 可用）、curl。首次启动需拉取镜像（MySQL/Kafka/Flink/Grafana）并执行 MySQL 初始化脚本，请留出几分钟。结果表 DDL 在 [mysql/ads_result_rt_ddl.sql](mysql/ads_result_rt_ddl.sql)，MySQL 卷丢失后需重跑（见 §5.3）。

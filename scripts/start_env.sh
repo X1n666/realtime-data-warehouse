@@ -21,9 +21,10 @@ declare -A JOBS=(
   [job1_ods_to_dwd]=4
   [job2_dwd_to_dws]=2
   [job2_trade_dws]=2
+  [job4_dim_lookup]=2
   [job3_ads_sink]=4
 )
-SQL_ORDER=(job1_ods_to_dwd.sql job2_dwd_to_dws.sql job2_trade_dws.sql job3_ads_sink.sql)
+SQL_ORDER=(job1_ods_to_dwd.sql job2_dwd_to_dws.sql job2_trade_dws.sql job4_dim_lookup.sql job3_ads_sink.sql)
 # 运行时依赖 topic（缺 = 数据丢了，需要先重放）
 TOPICS=(dwd_traffic_event dwd_payment_detail_sorted dwd_refund_detail
         dws_traffic_1m dws_traffic_day dws_trade_day dws_trade_1m)
@@ -125,6 +126,38 @@ for sql in "${SQL_ORDER[@]}"; do
 done
 
 # ---------- 5. 汇总 ----------
+# ---------- 4.5 空 topic 哨兵（最难发现的一类故障，2026-09-16 实测踩到） ----------
+# topic **存在但为空**（earliest == latest ≠ 0）不报任何错：
+#   下游以 auto.offset.reset=earliest 起读 → 落在 log-start = 末尾 → 读 0 条、
+#   作业保持 RUNNING、指标为 0、消费组因为没有提交位点而"不存在"。
+#   整条链路看起来完全健康，只是所有指标静默变空（本次排查花了一小时）。
+# 成因是三件事叠加（缺一不可）：
+#   ① Kafka 的 auto.create.topics.enable=true → 删除后立刻被在线消费者的 metadata
+#      请求自动重建为空 topic（日志特征 "Sent auto-creation request for Set(<topic>)"）；
+#   ② topic 删除是**异步**的，实测本机耗时 60s → 重建/生产与删除互相赛跑；
+#   ③ 消费端 committed offset 落在新 topic 的合法区间内（正好 = 末尾）→ 不回退。
+# 放在作业提交**之后**检查：冷启动时 dws_* 本来就是空的（要等作业跑出来），
+#   在提交前检查会误伤 --full 全新环境。作业已 RUNNING 后仍为空才是真信号。
+offset_of() { # $1=topic $2=-2(earliest)|-1(latest) → 打印 offset
+  MSYS_NO_PATHCONV=1 docker exec gmall_kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server localhost:9092 --topic "$1" --time "$2" 2>/dev/null | tail -1 | awk -F: '{print $NF}'
+}
+empty_topics=()
+for t in "${TOPICS[@]}"; do
+  e=$(offset_of "$t" -2); l=$(offset_of "$t" -1)
+  # 只统计"存在但为空"；不存在的 topic 由第 3 步负责（冷启动属正常）
+  [ -n "$e" ] && [ -n "$l" ] && [ "$e" = "$l" ] && empty_topics+=("$t(=$e)")
+done
+if [ ${#empty_topics[@]} -gt 0 ]; then
+  warn "空 topic 检测命中: ${empty_topics[*]}"
+  warn "  → 这不是'数据还没到'，是静默故障：作业会 RUNNING 但指标恒为空"
+  warn "  → dwd_payment_detail_sorted 为空: 跑 scripts/replay_dwd_payment_sorted.sh"
+  warn "    注意：必须先把订阅它的作业 cancel（job2_trade_dws / job4），否则删除会被"
+  warn "    在线消费者立刻自动重建，删不干净（实测复现为 60s 一轮的删除/重建循环）"
+else
+  say "4.5/6 空 topic 哨兵通过 ✓"
+fi
+
 say "5/6 最终作业清单:"
 docker exec gmall_jobmanager curl -s "$JM/jobs/overview" 2>/dev/null | python -c "
 import json,sys,collections

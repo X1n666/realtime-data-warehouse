@@ -7,6 +7,26 @@
 name: ecommerce-realtime-data-warehouse
 
 services:
+  # checkpoint 卷属主修复（2026-09-16）。Docker 给「镜像里不存在的路径」创建挂载点时
+  # 属主是 root:root/755，而 flink 镜像 PID 1 以 flink 用户运行 → JM/TM 建 checkpoint
+  # 目录时 EACCES，作业直接 JobInitializationException:
+  #   "Failed to create directory for shared state: file:/opt/flink/checkpoints/<jobId>/shared"
+  # 坑点：用 docker exec 进去试 mkdir 会成功（exec 默认 root），是**假阳性**——
+  # 必须用 ps 看 PID 1 的真实用户。这里用一次性 init 容器 chown 给 flink，
+  # 而不是把 Flink 改成 root 跑。
+  # 必须覆盖 entrypoint：flink 镜像的 /docker-entrypoint.sh 会把权限降级到 flink 用户
+  # （这同时解释了为什么 PID 1 是 flink 而 docker exec 进去是 root —— exec 绕过 entrypoint），
+  # 不覆盖的话 chown 会以 flink 身份执行 → "Operation not permitted"。
+  flink-checkpoints-init:
+    image: flink:1.19.1
+    container_name: gmall_flink_ckpt_init
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /opt/flink/checkpoints && chown -R flink:flink /opt/flink/checkpoints"]
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    restart: "no"
+
   mysql:
     image: mysql:8.0
     container_name: gmall_mysql
@@ -56,7 +76,17 @@ services:
     ports:
       - "29092:29092"
     volumes:
-      - kafka-data:/tmp/kraft-combined-logs   # apache/kafka 官方镜像 log.dirs=/tmp/kraft-combined-logs
+      # ⚠️ 已知缺陷（2026-09-16 实测，尚未修复——修复需重建 Kafka 容器，会清空全部 topic）
+      # 本镜像**实际**写的是 /tmp/kafka-logs（实测 du -sh 14MB，全是真实 topic 数据），
+      # 而这里是 /tmp/kraft-combined-logs（实测 4KB 空目录）→ **持久化卷完全没生效**，
+      # 所有 topic 数据都在容器可写层里：任何 recreate（改配置/down/换镜像）都会静默清空。
+      # 为什么"静默"：Kafka 的 auto.create.topics.enable=true（默认），topic 消失后会被
+      # 在线消费者的 metadata 请求**自动重建为空 topic**，下游以 earliest 起读 →
+      # 落在末尾 → 读 0 条、作业仍 RUNNING、指标恒空（本次就是这样排查了一小时）。
+      # 验证方法：docker exec gmall_kafka du -sh /tmp/kafka-logs /tmp/kraft-combined-logs
+      # 修复方向：显式 KAFKA_LOG_DIRS=<path> + 卷挂到该 path，并先 docker cp 迁移数据；
+      #   另建议显式建 topic（而不是依赖 auto-create），这样 topic 缺失会**报错**而非静默。
+      - kafka-data:/tmp/kraft-combined-logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
@@ -70,17 +100,28 @@ services:
     mem_limit: 768m
     command: jobmanager
     environment:
-      - JOB_MANAGER_RPC_ADDRESS=jobmanager
-      - JOB_MANAGER_MEMORY_PROCESS_SIZE=640m
-      - TZ=Asia/Shanghai
+      JOB_MANAGER_RPC_ADDRESS: jobmanager
+      JOB_MANAGER_MEMORY_PROCESS_SIZE: 640m
+      TZ: Asia/Shanghai
+      # checkpoint 落盘（2026-09-16 排查后修复）。不设该项时默认走
+      # JobManagerCheckpointStorage —— checkpoint 全在 JM 堆内存里，JM 一丢全丢、
+      # 无从 restore；且其 MemCheckpointStreamFactory 超过 5MB 会直接抛 IOException
+      # 让 checkpoint 失败（字节码实证，非告警）。
+      # 设了 dir 后存储自动切 FileSystemCheckpointStorage。官方要求 JM 与 TM 都配
+      # 该项、且路径两端都可达 → 两个容器挂同一个命名卷、同一路径。
+      FLINK_PROPERTIES: |
+        state.checkpoints.dir: file:///opt/flink/checkpoints
     ports:
       - "8081:8081"
     volumes:
       - ./flink-lib:/opt/flink/lib
+      - flink-checkpoints:/opt/flink/checkpoints
     restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
+      flink-checkpoints-init:
+        condition: service_completed_successfully
 
   taskmanager:
     image: flink:1.19.1
@@ -89,19 +130,24 @@ services:
     command: taskmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: jobmanager
-      # 12 slots: 9+ 作业（job1×3 + 流量分钟/日×4 + 交易×2），8 不够
-      TASK_MANAGER_NUMBER_OF_TASK_SLOTS: "12"
+      # 14 slots = 作业总数（job1×4 + 流量×2 + 交易×4 + 维度×2 + sink×4）。
+      # 原来是 12（紧配当时的 12 个作业）；job4 维度建模 +2 个 INSERT 分支后必须扩。
+      TASK_MANAGER_NUMBER_OF_TASK_SLOTS: "14"
       # 流作业托管内存基本闲置（状态小），默认 0.4 fraction 太浪费 → 0.1 留给任务堆
       FLINK_PROPERTIES: |
         taskmanager.memory.managed.fraction: 0.1
+        state.checkpoints.dir: file:///opt/flink/checkpoints
       TASK_MANAGER_MEMORY_PROCESS_SIZE: 2048m
       TZ: Asia/Shanghai
     volumes:
       - ./flink-lib:/opt/flink/lib
+      - flink-checkpoints:/opt/flink/checkpoints
     restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
+      flink-checkpoints-init:
+        condition: service_completed_successfully
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -123,3 +169,4 @@ services:
 volumes:
   mysql-data:
   kafka-data:
+  flink-checkpoints:   # checkpoint 落盘：JM/TM 同卷同路径（2026-09-16）

@@ -11,58 +11,101 @@
 #
 # 流程: dwd_payment_detail(乱序) --按 create_time 排序--> dwd_payment_detail_sorted
 # 排序稳定键: (create_time, id) —— 同秒记录按 id 保持确定性
+#
+# ============ 两个已实测的坑（2026-09-16 复盘修复，别改回去） ============
+# 1) 【必须等删除真的生效】原实现是 `--delete` 后 sleep 3 再 `--create`。
+#    Kafka 的 topic 删除是**异步**的（先标记 → controller 清理日志目录），
+#    实测本机删除耗时 **>30s**，sleep 3 远远不够 → create 撞上 "already exists"，
+#    然后 producer 往一个"随后才被真正删掉"的 topic 写 → **数据静默丢失**。
+#    实测后果（2026-09-16 发现）：本 topic 变成 earliest=latest=182 的**空 topic**
+#    （无任何 topic 级配置覆盖、保留期 7 天不可能过期，排除 retention），
+#    下游 job2/job4 以 earliest 起读 → 落到 182 = 末尾 → **一条不读、且不报错**
+#    （作业保持 RUNNING、指标为 0，极难发现）。
+#    → 现在改成：删完**轮询 --list 直到 topic 真的消失（最多 120s）**，再 create；
+#      删除没落地就**直接失败退出**，绝不在脏状态下继续。
+# 2) 【必须按 key 取最新版本】源 topic 是 upsert-kafka（key=id），job1 每次
+#    提交都会做一次全量快照重发 → 同一个 id 在 topic 里有 N 份历史副本。
+#    原实现 `--max-messages 182` 取的是**最老的 182 条**，等于按"最旧版本"
+#    重组状态。upsert 语义的正确读法是**每个 key 只保留最后一条**。
+#    → 现在改成：drain 全量 + 按 key 取最后一条 + 再排序，并断言唯一 key 数。
 # =============================================================
 set -euo pipefail
 
 BOOTSTRAP=localhost:9092
 SRC=dwd_payment_detail
 DST=dwd_payment_detail_sorted
-MAX_MSG=182        # 测试日 payment 全量行数（batch 锚点）
+EXPECT_KEYS=182    # 测试日 payment 全量行数（batch 锚点）
 DUMP=/tmp/payment_dump.tsv
 SORTED=/tmp/payment_sorted.tsv
 
-# 步骤1: dump 源 topic 全量（key\tvalue 两列，key=json{id}）
-echo "[1/4] dump $SRC ($MAX_MSG 条)..."
-MSYS_NO_PATHCONV=1 docker exec gmall_kafka sh -c \
-  "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
-   --topic $SRC --from-beginning --max-messages $MAX_MSG --property print.key=true 2>/dev/null" \
-  > "$DUMP"
-echo "  dumped: $(wc -l < "$DUMP") 行"
+kafka() { MSYS_NO_PATHCONV=1 docker exec "$@" ; }
+kctl()  { kafka gmall_kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BOOTSTRAP "$@" ; }
 
-# 步骤2: python 按 (create_time, id) 稳定排序
-echo "[2/4] 按 create_time 排序..."
-python - "$DUMP" "$SORTED" <<'PY'
+# 步骤1: drain 源 topic 全量（key\tvalue 两列，key=json{id}）
+#   --timeout-ms: 源 topic 不会关闭，靠"静默超时"退出；超时退出码非 0 → || true，
+#   实际完整性由下一步的"唯一 key 数断言"保证（不是靠退出码）。
+echo "[1/5] dump $SRC 全量（含历史副本）..."
+kafka -i gmall_kafka sh -c \
+  "/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server $BOOTSTRAP \
+   --topic $SRC --from-beginning --timeout-ms 8000 --property print.key=true 2>/dev/null" \
+  > "$DUMP" || true
+echo "  dumped: $(wc -l < "$DUMP") 条原始记录"
+
+# 步骤2: 按 key 取最新（upsert 语义）→ 按 (create_time, id) 稳定排序
+echo "[2/5] 按 key 取最新版本 → 按 create_time 排序..."
+python - "$DUMP" "$SORTED" "$EXPECT_KEYS" <<'PY'
 import sys, json
-src, dst = sys.argv[1], sys.argv[2]
-rows = []
+src, dst, expect = sys.argv[1], sys.argv[2], int(sys.argv[3])
+latest = {}                      # key -> (create_time, id, 行内容)
+raw = 0
 for line in open(src, encoding='utf-8'):
-    key, _, value = line.rstrip('\n').partition('\t')
-    ct = json.loads(value)['create_time']
-    iid = json.loads(key)['id']
-    rows.append((ct, iid, key + '\t' + value + '\n'))
-rows.sort(key=lambda r: (r[0], r[1]))          # (create_time, id) 稳定确定序
+    line = line.rstrip('\n')
+    if not line:
+        continue
+    raw += 1
+    key, _, value = line.partition('\t')
+    if not _:
+        continue
+    j = json.loads(value)
+    k = json.loads(key)['id']
+    latest[k] = (j['create_time'], k, key + '\t' + value + '\n')   # 同名 key 覆盖 = 取最后一条
+rows = sorted(latest.values(), key=lambda r: (r[0], r[1]))         # (create_time, id) 稳定确定序
 with open(dst, 'w', encoding='utf-8') as f:
     f.writelines(r[2] for r in rows)
-# 验证: 时间序列应单调不减
 ts = [r[0] for r in rows]
 assert ts == sorted(ts), '排序结果非单调！'
-print(f'  sorted: {len(rows)} 行, 时间单调性校验通过: {ts[0]} .. {ts[-1]}')
+print(f'  原始 {raw} 条 → 去重后 {len(rows)} 个 key（期望 {expect}），时间单调性校验通过: {ts[0]} .. {ts[-1]}')
+assert len(rows) == expect, f'唯一 key 数 {len(rows)} != 期望 {expect}：源 topic 数据不完整或含有额外测试行'
 PY
 
-# 步骤3: 建目标 topic（已存在则先删——幂等重跑）
-echo "[3/4] 建 $DST topic..."
-MSYS_NO_PATHCONV=1 docker exec gmall_kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server $BOOTSTRAP --delete --topic $DST 2>/dev/null || true
-sleep 3
-MSYS_NO_PATHCONV=1 docker exec gmall_kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server $BOOTSTRAP --create --topic $DST --partitions 1 --replication-factor 1 2>&1 | tail -1
+# 步骤3: 重建目标 topic —— 必须等删除真正生效（见文件头坑 1）
+echo "[3/5] 重建 $DST topic（等删除生效）..."
+kctl --delete --topic $DST 2>/dev/null || true
+gone=0
+for i in $(seq 1 120); do
+  kctl --list 2>/dev/null | grep -qx "$DST" || { echo "  删除已生效（轮询 ${i}s）"; gone=1; break; }
+  sleep 1
+done
+# 实测：本机 Kafka 的 topic 删除耗时**远超**原来的 sleep 3（>30s）。删除没落地就 create
+# 会拿到"Topic already exists"并继续往一个"随后才被删掉"的 topic 生产 → 数据静默丢失。
+# 所以这里宁可失败退出，也不在未删除干净的情况下继续。
+[ "$gone" = 1 ] || { echo "  失败: 120s 内 topic 仍未删除干净，中止（避免继承旧 log-start-offset）"; exit 1; }
+kctl --create --topic $DST --partitions 1 --replication-factor 1 2>&1 | tail -1
 
 # 步骤4: producer 灌入（key/value 均 json）
-echo "[4/4] 灌入 $DST..."
-MSYS_NO_PATHCONV=1 docker exec -i gmall_kafka /opt/kafka/bin/kafka-console-producer.sh \
+echo "[4/5] 灌入 $DST..."
+kafka -i gmall_kafka /opt/kafka/bin/kafka-console-producer.sh \
   --bootstrap-server $BOOTSTRAP --topic $DST \
   --property parse.key=true --property key.separator=$'\t' < "$SORTED"
 
-echo "完成。验证:"
-MSYS_NO_PATHCONV=1 docker exec gmall_kafka /opt/kafka/bin/kafka-get-offsets.sh \
-  --bootstrap-server $BOOTSTRAP --topic $DST 2>/dev/null | grep -v '^$'
+# 步骤5: 产出校验（earliest 必须是 0 —— 非 0 说明重建没干净）
+echo "[5/5] 校验:"
+kafka gmall_kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server $BOOTSTRAP --topic $DST 2>/dev/null | grep -v '^$' | sed 's/^/  /'
+early=$(kafka gmall_kafka /opt/kafka/bin/kafka-get-offsets.sh \
+        --bootstrap-server $BOOTSTRAP --topic $DST --time -2 2>/dev/null | tail -1)
+late=$(kafka gmall_kafka /opt/kafka/bin/kafka-get-offsets.sh \
+       --bootstrap-server $BOOTSTRAP --topic $DST --time -1 2>/dev/null | tail -1)
+[ "${early##*:}" = 0 ] || { echo "  失败: earliest=${early##*:}（应为 0，topic 重建未生效）"; exit 1; }
+[ "${late##*:}" = "$EXPECT_KEYS" ] || { echo "  失败: latest=${late##*:}（应为 $EXPECT_KEYS）"; exit 1; }
+echo "  earliest=0 / latest=$EXPECT_KEYS ✓ 重排完成"
