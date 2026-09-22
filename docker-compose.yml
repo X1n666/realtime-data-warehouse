@@ -1,6 +1,6 @@
 # 电商实时数仓 - WSL2 独立环境（V2 设计第 6 节）
-# 内存预算 ≈ 5.75G；WSL2 需 .wslconfig 限 memory=8GB
-# 版本锁定：Flink 1.19.1 / Kafka 3.5.2 KRaft / MySQL 8.0 / Grafana 11.1.0
+# 内存预算 ≈ 5.75G；WSL2 需 .wslconfig 限 memory=10GB
+# 版本锁定：Flink 1.19.1 / Kafka 3.7.1 KRaft / MySQL 8.0 / Grafana 11.1.0
 
 # 固定 compose 项目名：目录为中文名（实时数据分析平台）时 compose 默认项目名
 # 会非法/变化，导致网络名（submit_sql.sh 写死）漂移；显式固定为英文名
@@ -86,33 +86,47 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # ⚠️ 这里**故意没有**设 KAFKA_LOG_RETENTION_HOURS: "-1"，虽然它本该设。
-      # 原因：保留期默认 168 小时，而本项目记录的 Kafka 时间戳 = 重放那一刻
+      # 保留期显式设为 -1（永久）。这里记录它为什么一度被**故意注释掉**：
+      # 默认保留期 168 小时，而本项目记录的 Kafka 时间戳 = 重放那一刻
       # （业务时间 2026-09-01 只存在消息体里）→ 这套"固定历史测试日"的数据集
       # 写入满 7 天就会被 retention cleaner 静默删掉：topic 还在、作业全 RUNNING、
       # 指标还是旧值，只是源数据没了（实测 ods_traffic_log 被删空，log start offset
       # 从 0 跳到 2000；同期其余 topic 距同一失效点只剩 79 分钟）。
-      # 但**加这个 env 会触发 Kafka 容器重建**（实测 --dry-run），
-      # 而下面 kafka-data 卷挂错路径 → 重建 = 静默清空全部 topic。
-      # 所以保留期改由**不需要重建**的两层兜住（都已生效）：
-      #   ① 运行中集群: broker 动态配置 log.retention.ms=-1 + 各 topic retention.ms=-1
-      #   ② 脚本层: scripts/start_env.sh 每次启动幂等收敛一遍 topic 级 retention.ms=-1；
-      #     两个重放脚本创建 topic 时也显式带 --config retention.ms=-1
-      # 待卷修复完成、需要重建 Kafka 时，再把 KAFKA_LOG_RETENTION_HOURS: "-1" 加回来。
+      # 之所以拖到 2026-09-22 才加：加 env 会触发 Kafka 容器重建，而当时 kafka-data
+      # 卷挂错路径（见下面 volumes）→ 重建 = 静默清空全部 topic。卷修好后才补上。
+      KAFKA_LOG_RETENTION_HOURS: "-1"
+      # ⚠️ 必须显式指定，别删。不设的话镜像生成的
+      # /opt/kafka/config/server.properties 里**不会有 log.dirs**，broker 就回退到
+      # Kafka 代码里的硬编码默认值 /tmp/kafka-logs，而卷却挂在别处 → 持久化完全失效。
+      # 这正是 2026-09-16~09-22 期间那个"重建即静默清空全部 topic"缺陷的根因，
+      # 详见下面 volumes 的说明。
+      KAFKA_LOG_DIRS: "/tmp/kafka-logs"
     ports:
       - "29092:29092"
     volumes:
-      # ⚠️ 已知缺陷（2026-09-16 实测，尚未修复——修复需重建 Kafka 容器，会清空全部 topic）
-      # 本镜像**实际**写的是 /tmp/kafka-logs（实测 du -sh 14MB，全是真实 topic 数据），
-      # 而这里是 /tmp/kraft-combined-logs（实测 4KB 空目录）→ **持久化卷完全没生效**，
-      # 所有 topic 数据都在容器可写层里：任何 recreate（改配置/down/换镜像）都会静默清空。
-      # 为什么"静默"：Kafka 的 auto.create.topics.enable=true（默认），topic 消失后会被
-      # 在线消费者的 metadata 请求**自动重建为空 topic**，下游以 earliest 起读 →
-      # 落在末尾 → 读 0 条、作业仍 RUNNING、指标恒空（本次就是这样排查了一小时）。
-      # 验证方法：docker exec gmall_kafka du -sh /tmp/kafka-logs /tmp/kraft-combined-logs
-      # 修复方向：显式 KAFKA_LOG_DIRS=<path> + 卷挂到该 path，并先 docker cp 迁移数据；
-      #   另建议显式建 topic（而不是依赖 auto-create），这样 topic 缺失会**报错**而非静默。
-      - kafka-data:/tmp/kraft-combined-logs
+      # 已修复（2026-09-22）。原来挂的是 /tmp/kraft-combined-logs，而 broker 实际写
+      # /tmp/kafka-logs → 持久化卷形同虚设，全部 topic 只活在容器可写层里，
+      # 任何 recreate（改配置/down/换镜像）都会静默清空（2026-09-16 实测：
+      # 卷里 4KB、真实数据 18MB 全在可写层）。
+      #
+      # 根因不是"镜像默认值写错了"，而是**我们没设 KAFKA_LOG_DIRS**：
+      #   · 镜像自带 /etc/kafka/docker/server.properties 写着
+      #     log.dirs=/tmp/kraft-combined-logs——但那个文件只用于初始化格式化那一步；
+      #   · 真正生效的是 entrypoint 里 KafkaDockerWrapper 生成的
+      #     /opt/kafka/config/server.properties，它**只写入 env 里显式给过的项**，
+      #     不含 log.dirs → broker 回退到 Kafka 代码硬编码默认值 /tmp/kafka-logs。
+      # 两边各说各话，于是卷挂在一个永远没人写的目录上。
+      #
+      # 为什么"静默"：auto.create.topics.enable=true（默认），topic 消失后会被在线消费者
+      # 的 metadata 请求**自动重建为空 topic**，下游以 earliest 起读 → 落在末尾 →
+      # 读 0 条、作业仍 RUNNING、指标恒空（上次就是这样排查了一小时）。
+      #
+      # 迁移做法：docker stop kafka → docker cp 出 /tmp/kafka-logs → 灌进本卷并把
+      # 属主改成 appuser(1000) → 改这里两行 → 重建 → 逐 topic 核对 offset。
+      # 验证方法（两边数字必须一致，不一致就是卷又没挂上）：
+      #   docker exec gmall_kafka du -sh /tmp/kafka-logs
+      #   docker run --rm -v ecommerce-realtime-data-warehouse_kafka-data:/d alpine du -sh /d
+      - kafka-data:/tmp/kafka-logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
